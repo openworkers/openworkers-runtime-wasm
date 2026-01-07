@@ -138,7 +138,7 @@ impl WasmWorker {
             .ok_or_else(|| TerminationReason::Exception("No memory export".to_string()))?;
 
         let request_bytes = request_json.as_bytes();
-        let request_ptr = allocate_guest_memory(&instance, &mut store, request_bytes.len())?;
+        let request_ptr = allocate_guest_memory(&instance, &mut store, request_bytes.len()).await?;
 
         memory
             .write(&mut store, request_ptr as usize, request_bytes)
@@ -325,7 +325,7 @@ fn serialize_request(request: &HttpRequest) -> String {
 }
 
 /// Allocate memory in the guest for writing data
-fn allocate_guest_memory(
+async fn allocate_guest_memory(
     instance: &Instance,
     store: &mut Store<WasmState>,
     size: usize,
@@ -333,7 +333,8 @@ fn allocate_guest_memory(
     // Try to call the guest's allocate function
     match instance.get_typed_func::<i32, i32>(&mut *store, "allocate") {
         Ok(alloc_fn) => alloc_fn
-            .call(&mut *store, size as i32)
+            .call_async(&mut *store, size as i32)
+            .await
             .map_err(|e| TerminationReason::Exception(format!("allocate failed: {}", e))),
         Err(_) => {
             // Fallback: use a fixed offset (simple but limited)
