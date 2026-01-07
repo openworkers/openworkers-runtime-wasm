@@ -31,8 +31,8 @@ async fn test_hello_worker_fetch() {
         bindings: vec![],
     };
 
-    // Create worker
-    let mut worker = WasmWorker::new(script, None)
+    // Create worker (no ops handle, so fetch won't work)
+    let mut worker = WasmWorker::new(script, None, None)
         .await
         .expect("Failed to create worker");
 
@@ -86,7 +86,7 @@ async fn test_hello_worker_scheduled() {
         bindings: vec![],
     };
 
-    let mut worker = WasmWorker::new(script, None)
+    let mut worker = WasmWorker::new(script, None, None)
         .await
         .expect("Failed to create worker");
 

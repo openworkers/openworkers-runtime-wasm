@@ -7,8 +7,9 @@ description = "WebAssembly runtime for OpenWorkers using Wasmtime"
 license = "Apache-2.0"
 
 [dependencies]
-# Core types
-openworkers-core = { path = "../openworkers-core" }
+# Core types (with wasm feature for WorkerCode::WebAssembly)
+# openworkers-core = { path = "../openworkers-core", features = ["wasm"] }
+openworkers-core = { git = "https://github.com/openworkers/openworkers-core", tag = "v0.8.1", features = ["wasm"] }
 
 # Wasmtime runtime with component model and WASI support
 wasmtime = { version = "29", features = ["component-model"] }

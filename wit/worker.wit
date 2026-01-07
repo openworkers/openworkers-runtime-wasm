@@ -31,11 +31,17 @@ interface types {
 
 /// Host functions available to workers
 interface host {
+    use types.{http-request, http-response};
+
     /// Log a message at the specified level (0=debug, 1=info, 2=warn, 3=error)
     log: func(level: u8, message: string);
 
     /// Get an environment variable, returns none if not set
     get-env: func(key: string) -> option<string>;
+
+    /// Fetch a URL (outbound HTTP request)
+    /// Returns the response or an error string
+    fetch: func(request: http-request) -> result<http-response, string>;
 }
 
 /// Worker interface that guests must implement

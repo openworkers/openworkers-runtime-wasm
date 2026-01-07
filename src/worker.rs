@@ -3,13 +3,13 @@
 //! Uses WIT (WebAssembly Interface Types) for type-safe host/guest communication.
 
 use openworkers_core::{
-    HttpRequest, HttpResponse, RequestBody, ResponseBody, RuntimeLimits, Script, Task,
-    TerminationReason, WorkerCode,
+    HttpMethod, HttpRequest, HttpResponse, OperationsHandle, RequestBody, ResponseBody,
+    RuntimeLimits, Script, Task, TerminationReason, WorkerCode,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use wasmtime::component::{bindgen, Component, Linker, ResourceTable};
+use std::sync::atomic::{AtomicBool, Ordering};
+use wasmtime::component::{Component, Linker, ResourceTable, bindgen};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
@@ -35,10 +35,16 @@ pub struct WasmState {
     /// Abort flag
     #[allow(dead_code)]
     aborted: Arc<AtomicBool>,
+    /// Operations handle for fetch, KV, etc. (delegated to runner)
+    ops: Option<OperationsHandle>,
 }
 
 impl WasmState {
-    fn new(env: HashMap<String, String>, aborted: Arc<AtomicBool>) -> Self {
+    fn new(
+        env: HashMap<String, String>,
+        aborted: Arc<AtomicBool>,
+        ops: Option<OperationsHandle>,
+    ) -> Self {
         // Build WASI context with environment variables
         let mut wasi_builder = WasiCtxBuilder::new();
 
@@ -51,6 +57,7 @@ impl WasmState {
             table: ResourceTable::new(),
             env,
             aborted,
+            ops,
         }
     }
 }
@@ -82,6 +89,60 @@ impl openworkers::worker::host::Host for WasmState {
     async fn get_env(&mut self, key: String) -> Option<String> {
         self.env.get(&key).cloned()
     }
+
+    async fn fetch(&mut self, request: WitHttpRequest) -> Result<WitHttpResponse, String> {
+        let ops = self
+            .ops
+            .as_ref()
+            .ok_or_else(|| "fetch not available: no operations handle".to_string())?;
+
+        // Convert WIT request to core HttpRequest
+        let method = match request.method {
+            WitHttpMethod::Get => HttpMethod::Get,
+            WitHttpMethod::Post => HttpMethod::Post,
+            WitHttpMethod::Put => HttpMethod::Put,
+            WitHttpMethod::Delete => HttpMethod::Delete,
+            WitHttpMethod::Patch => HttpMethod::Patch,
+            WitHttpMethod::Head => HttpMethod::Head,
+            WitHttpMethod::Options => HttpMethod::Options,
+        };
+
+        let body = match request.body {
+            None => RequestBody::None,
+            Some(bytes) => RequestBody::Bytes(bytes::Bytes::from(bytes)),
+        };
+
+        let headers: HashMap<String, String> = request.headers.into_iter().collect();
+
+        let core_request = HttpRequest {
+            method,
+            url: request.url,
+            headers,
+            body,
+        };
+
+        // Delegate to runner via OperationsHandle
+        let response = ops
+            .handle_fetch(core_request)
+            .await
+            .map_err(|e| format!("fetch failed: {}", e))?;
+
+        // Convert core HttpResponse to WIT response
+        // Note: Streams are not supported in WASM - they would require async iteration
+        let body = match response.body {
+            ResponseBody::None => None,
+            ResponseBody::Bytes(b) => Some(b.to_vec()),
+            ResponseBody::Stream(_) => {
+                return Err("streaming responses not supported in WASM".to_string());
+            }
+        };
+
+        Ok(WitHttpResponse {
+            status: response.status,
+            headers: response.headers,
+            body,
+        })
+    }
 }
 
 // Implement the types interface (required even if it only has types)
@@ -99,13 +160,27 @@ pub struct WasmWorker {
     aborted: Arc<AtomicBool>,
     /// Environment variables from script
     env: HashMap<String, String>,
+    /// Operations handle for fetch, KV, etc. (delegated to runner)
+    ops: Option<OperationsHandle>,
 }
 
 impl WasmWorker {
+    /// Create a new WASM worker with an OperationsHandler
+    ///
+    /// All operations (fetch, log, etc.) go through the runner's OperationsHandler.
+    pub async fn new_with_ops(
+        script: Script,
+        limits: Option<RuntimeLimits>,
+        ops: OperationsHandle,
+    ) -> Result<Self, TerminationReason> {
+        WasmWorker::new(script, limits, Some(ops)).await
+    }
+
     /// Create a new WASM worker from a Component
     pub async fn new(
         script: Script,
         limits: Option<RuntimeLimits>,
+        ops: Option<OperationsHandle>,
     ) -> Result<Self, TerminationReason> {
         let limits = limits.unwrap_or_default();
 
@@ -148,6 +223,7 @@ impl WasmWorker {
             limits,
             aborted: Arc::new(AtomicBool::new(false)),
             env: script.env.unwrap_or_default(),
+            ops,
         })
     }
 
@@ -252,7 +328,7 @@ impl WasmWorker {
 
     /// Create a new store with state
     fn create_store(&self) -> Result<Store<WasmState>, TerminationReason> {
-        let state = WasmState::new(self.env.clone(), self.aborted.clone());
+        let state = WasmState::new(self.env.clone(), self.aborted.clone(), self.ops.clone());
         let mut store = Store::new(&self.engine, state);
 
         // Set fuel for CPU limiting (if enabled)
@@ -321,7 +397,7 @@ impl WasmWorker {
 // Implement the Worker trait
 impl openworkers_core::Worker for WasmWorker {
     async fn new(script: Script, limits: Option<RuntimeLimits>) -> Result<Self, TerminationReason> {
-        WasmWorker::new(script, limits).await
+        WasmWorker::new(script, limits, None).await
     }
 
     async fn exec(&mut self, task: Task) -> Result<(), TerminationReason> {
