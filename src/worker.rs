@@ -130,6 +130,11 @@ impl WasmWorker {
                     "WASM runtime cannot execute JavaScript code".to_string(),
                 ));
             }
+            WorkerCode::Snapshot(_) => {
+                return Err(TerminationReason::InitializationError(
+                    "WASM runtime cannot execute snapshots".to_string(),
+                ));
+            }
         };
 
         // Compile the component

@@ -21,10 +21,7 @@ impl Guest for HelloWorker {
         // Log the request
         host::log(
             1,
-            &format!(
-                "Received {:?} request to {}",
-                request.method, request.url
-            ),
+            &format!("Received {:?} request to {}", request.method, request.url),
         );
 
         // Get greeting from env or use default
@@ -50,7 +47,10 @@ impl Guest for HelloWorker {
     }
 
     fn handle_scheduled(scheduled_time: u64) {
-        host::log(1, &format!("Scheduled event at timestamp: {}", scheduled_time));
+        host::log(
+            1,
+            &format!("Scheduled event at timestamp: {}", scheduled_time),
+        );
     }
 }
 
