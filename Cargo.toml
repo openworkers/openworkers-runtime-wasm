@@ -10,22 +10,15 @@ license = "Apache-2.0"
 # Core types
 openworkers-core = { path = "../openworkers-core" }
 
-# Wasmtime runtime
-wasmtime = "29"
-# wasmtime-wasi = "29"  # TODO: Add WASI support later
+# Wasmtime runtime with component model and WASI support
+wasmtime = { version = "29", features = ["component-model"] }
+wasmtime-wasi = "29"
 
 # Async runtime
 tokio = { version = "1", features = ["sync", "time", "rt"] }
 
-# Serialization (for host<->guest communication)
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
 # Bytes handling
 bytes = "1"
-
-# Base64 for WASM encoding
-base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }

@@ -1,19 +1,19 @@
 //! Integration test for hello-worker WASM module
 
-use openworkers_core::{HttpMethod, HttpRequest, RequestBody, Script, Task};
+use openworkers_core::{HttpMethod, HttpRequest, RequestBody, Script, Task, WorkerCode};
 use openworkers_runtime_wasm::WasmWorker;
 use std::collections::HashMap;
 
-/// Load the hello-worker WASM binary
+/// Load the hello-worker WASM component
 fn load_hello_worker_wasm() -> Vec<u8> {
     let wasm_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/examples/hello-worker/target/wasm32-unknown-unknown/release/hello_worker.wasm"
+        "/examples/hello-worker/target/wasm32-wasip2/release/hello_worker.wasm"
     );
 
     std::fs::read(wasm_path).expect(&format!(
         "Failed to read WASM file. Build it first with:\n\
-         cd examples/hello-worker && cargo build --target wasm32-unknown-unknown --release"
+         cd examples/hello-worker && cargo build --target wasm32-wasip2 --release"
     ))
 }
 
@@ -21,9 +21,9 @@ fn load_hello_worker_wasm() -> Vec<u8> {
 async fn test_hello_worker_fetch() {
     let wasm_bytes = load_hello_worker_wasm();
 
-    // Create script with WASM bytes (raw bytes work because of magic number detection)
+    // Create script with WASM bytes
     let script = Script {
-        code: unsafe { String::from_utf8_unchecked(wasm_bytes) },
+        code: WorkerCode::WebAssembly(wasm_bytes),
         env: Some(HashMap::from([(
             "GREETING".to_string(),
             "Bonjour".to_string(),
@@ -81,7 +81,7 @@ async fn test_hello_worker_scheduled() {
     let wasm_bytes = load_hello_worker_wasm();
 
     let script = Script {
-        code: unsafe { String::from_utf8_unchecked(wasm_bytes) },
+        code: WorkerCode::WebAssembly(wasm_bytes),
         env: None,
         bindings: vec![],
     };

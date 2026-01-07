@@ -1,0 +1,56 @@
+package openworkers:worker@0.1.0;
+
+/// Shared types for HTTP handling
+interface types {
+    /// HTTP method
+    enum http-method {
+        get,
+        post,
+        put,
+        delete,
+        patch,
+        head,
+        options,
+    }
+
+    /// HTTP request from the runtime to the worker
+    record http-request {
+        method: http-method,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+
+    /// HTTP response from the worker to the runtime
+    record http-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+}
+
+/// Host functions available to workers
+interface host {
+    /// Log a message at the specified level (0=debug, 1=info, 2=warn, 3=error)
+    log: func(level: u8, message: string);
+
+    /// Get an environment variable, returns none if not set
+    get-env: func(key: string) -> option<string>;
+}
+
+/// Worker interface that guests must implement
+interface handler {
+    use types.{http-request, http-response};
+
+    /// Handle an HTTP fetch event
+    handle-fetch: func(request: http-request) -> http-response;
+
+    /// Handle a scheduled event (cron)
+    handle-scheduled: func(scheduled-time: u64);
+}
+
+/// The world that workers implement
+world worker {
+    import host;
+    export handler;
+}
