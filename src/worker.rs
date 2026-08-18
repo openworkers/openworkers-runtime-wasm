@@ -49,6 +49,9 @@ const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// this assumes 10k instructions per ms. Not calibrated against real hardware.
 const FUEL_UNITS_PER_MS: u64 = 10_000;
 
+/// Length at which an unterminated guest log line is emitted anyway
+const MAX_LOG_LINE: usize = 8 * 1024;
+
 /// State held by each WASM instance
 struct WasmState {
     /// WASI context
@@ -311,6 +314,13 @@ impl tokio::io::AsyncWrite for OpsLogWriter {
         while let Some(pos) = this.buffer.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = this.buffer.drain(..=pos).collect();
             this.emit(&line[..line.len() - 1]);
+        }
+
+        // Guest output is not covered by the wasm memory limit, so a guest
+        // that never writes a newline must not grow this buffer forever
+        if this.buffer.len() >= MAX_LOG_LINE {
+            let line = std::mem::take(&mut this.buffer);
+            this.emit(&line);
         }
 
         Poll::Ready(Ok(buf.len()))

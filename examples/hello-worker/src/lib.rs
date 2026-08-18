@@ -53,6 +53,13 @@ impl HttpGuest for HelloWorker {
             return;
         }
 
+        if path.starts_with("/longlog") {
+            println!("{}", "x".repeat(20_000));
+
+            respond(response_out, 200, Vec::new());
+            return;
+        }
+
         if path.starts_with("/spin") {
             loop {
                 std::hint::black_box(0);

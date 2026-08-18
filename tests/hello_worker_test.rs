@@ -205,6 +205,43 @@ async fn test_log_and_fetch_flow_through_ops() {
 }
 
 #[tokio::test]
+async fn test_long_guest_log_line_is_split() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let ops = Arc::new(MockOps {
+        logs: Mutex::new(vec![]),
+        fetched_urls: Mutex::new(vec![]),
+    });
+
+    let mut worker = WasmWorker::new_with_ops(script, None, ops.clone())
+        .await
+        .expect("Failed to create worker");
+
+    let (event, rx) = Event::fetch(get_request("https://example.com/longlog"));
+    worker.exec(event).await.expect("Failed to execute event");
+    rx.await.expect("Failed to receive response");
+
+    let logs = ops.logs.lock().unwrap();
+
+    let lengths: Vec<usize> = logs
+        .iter()
+        .filter(|(_, message)| message.starts_with('x'))
+        .map(|(_, message)| message.len())
+        .collect();
+
+    assert!(
+        lengths.len() > 1,
+        "a 20k character line should be split, got {:?}",
+        lengths
+    );
+    assert_eq!(lengths.iter().sum::<usize>(), 20_000);
+}
+
+#[tokio::test]
 async fn test_infinite_loop_hits_wall_clock_limit() {
     let script = Script {
         code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
