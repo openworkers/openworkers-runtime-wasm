@@ -9,9 +9,19 @@ use openworkers_core::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use std::time::Instant;
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable, bindgen};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{Config, Engine, ResourceLimiter, Store, Trap, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+/// Interval of the background thread driving epoch interruption; also the
+/// granularity of wall-clock and abort checks
+const EPOCH_TICK: Duration = Duration::from_millis(10);
+
+/// Crude CPU metering: wasmtime charges roughly one fuel per instruction and
+/// this assumes 10k instructions per ms. Not calibrated against real hardware.
+const FUEL_UNITS_PER_MS: u64 = 10_000;
 
 // Generate bindings from the WIT file
 bindgen!({
@@ -34,10 +44,13 @@ pub struct WasmState {
     /// Environment variables (for our custom host interface)
     env: HashMap<String, String>,
     /// Abort flag
-    #[allow(dead_code)]
     aborted: Arc<AtomicBool>,
     /// Operations handle for fetch, KV, etc. (delegated to runner)
     ops: Option<OperationsHandle>,
+    /// Wall-clock deadline for this execution (None = no limit)
+    deadline: Option<Instant>,
+    /// Memory limiter enforcing heap_max_mb
+    limiter: MemoryLimiter,
 }
 
 impl WasmState {
@@ -45,6 +58,8 @@ impl WasmState {
         env: HashMap<String, String>,
         aborted: Arc<AtomicBool>,
         ops: Option<OperationsHandle>,
+        deadline: Option<Instant>,
+        max_memory_bytes: usize,
     ) -> Self {
         // Build WASI context with environment variables
         let mut wasi_builder = WasiCtxBuilder::new();
@@ -59,7 +74,45 @@ impl WasmState {
             env,
             aborted,
             ops,
+            deadline,
+            limiter: MemoryLimiter {
+                max_memory_bytes,
+                memory_limit_hit: false,
+            },
         }
+    }
+}
+
+/// Per-store memory cap; records when the cap denied a growth so the failure
+/// can be reported as MemoryLimit instead of a generic trap
+struct MemoryLimiter {
+    max_memory_bytes: usize,
+    memory_limit_hit: bool,
+}
+
+impl ResourceLimiter for MemoryLimiter {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if desired > self.max_memory_bytes {
+            self.memory_limit_hit = true;
+
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(true)
     }
 }
 
@@ -187,6 +240,9 @@ impl WasmWorker {
 
         let mut config = Config::new();
 
+        // Epoch interruption drives wall-clock limits and abort()
+        config.epoch_interruption(true);
+
         // Enable fuel-based metering for CPU limiting
         if limits.max_cpu_time_ms > 0 {
             config.consume_fuel(true);
@@ -195,6 +251,21 @@ impl WasmWorker {
         let engine = Engine::new(&config).map_err(|e| {
             TerminationReason::InitializationError(format!("Failed to create engine: {}", e))
         })?;
+
+        // Ticker thread; exits once the engine (and thus the worker) is dropped
+        let engine_weak = engine.weak();
+
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(EPOCH_TICK);
+
+                let Some(engine) = engine_weak.upgrade() else {
+                    break;
+                };
+
+                engine.increment_epoch();
+            }
+        });
 
         // Extract WASM bytes from WorkerCode
         let wasm_bytes = match &script.code {
@@ -299,11 +370,13 @@ impl WasmWorker {
         let wit_request = self.to_wit_request(request)?;
 
         // Call the handler
-        let wit_response = worker
+        let call_result = worker
             .openworkers_worker_handler()
             .call_handle_fetch(&mut store, &wit_request)
-            .await
-            .map_err(|e| TerminationReason::Exception(format!("handle_fetch failed: {}", e)))?;
+            .await;
+
+        let wit_response =
+            call_result.map_err(|e| Self::termination_reason(&store, "handle_fetch", e))?;
 
         // Convert response back
         Ok(self.from_wit_response(wit_response))
@@ -313,36 +386,90 @@ impl WasmWorker {
     async fn handle_scheduled(&mut self, time: u64) -> Result<(), TerminationReason> {
         let (mut store, worker) = self.instantiate().await?;
 
-        worker
+        let call_result = worker
             .openworkers_worker_handler()
             .call_handle_scheduled(&mut store, time)
-            .await
-            .map_err(|e| TerminationReason::Exception(format!("handle_scheduled failed: {}", e)))?;
+            .await;
+
+        call_result.map_err(|e| Self::termination_reason(&store, "handle_scheduled", e))?;
 
         Ok(())
     }
 
     /// Create a fresh store and instantiate the pre-linked component in it
     async fn instantiate(&self) -> Result<(Store<WasmState>, Worker), TerminationReason> {
-        let state = WasmState::new(self.env.clone(), self.aborted.clone(), self.ops.clone());
+        let deadline = (self.limits.max_wall_clock_time_ms > 0)
+            .then(|| Instant::now() + Duration::from_millis(self.limits.max_wall_clock_time_ms));
+
+        let state = WasmState::new(
+            self.env.clone(),
+            self.aborted.clone(),
+            self.ops.clone(),
+            deadline,
+            self.limits.heap_max_mb * 1024 * 1024,
+        );
+
         let mut store = Store::new(&self.engine, state);
 
-        // Set fuel for CPU limiting (if enabled)
+        store.limiter(|state| &mut state.limiter);
+
         if self.limits.max_cpu_time_ms > 0 {
-            // Approximate: 1ms is about 10000 fuel units (rough estimate)
-            let fuel = self.limits.max_cpu_time_ms * 10000;
-            store.set_fuel(fuel).ok();
+            store
+                .set_fuel(self.limits.max_cpu_time_ms * FUEL_UNITS_PER_MS)
+                .ok();
         }
 
-        let worker = self
-            .instance_pre
-            .instantiate_async(&mut store)
-            .await
-            .map_err(|e| {
-                TerminationReason::Exception(format!("Failed to instantiate component: {}", e))
-            })?;
+        // Re-check the wall-clock deadline and abort flag on every epoch tick
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(|cx| {
+            let state = cx.data();
+
+            if state.aborted.load(Ordering::SeqCst) {
+                return Ok(UpdateDeadline::Interrupt);
+            }
+
+            if state.deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok(UpdateDeadline::Interrupt);
+            }
+
+            Ok(UpdateDeadline::Continue(1))
+        });
+
+        let worker = match self.instance_pre.instantiate_async(&mut store).await {
+            Ok(worker) => worker,
+            Err(e) => return Err(Self::termination_reason(&store, "instantiate", e)),
+        };
 
         Ok((store, worker))
+    }
+
+    /// Map a failed guest call to a TerminationReason using the store state
+    fn termination_reason(
+        store: &Store<WasmState>,
+        context: &str,
+        e: wasmtime::Error,
+    ) -> TerminationReason {
+        let state = store.data();
+
+        // A denied memory growth surfaces as a guest allocation failure trap,
+        // so the limiter flag has to be checked before the trap code
+        if state.limiter.memory_limit_hit {
+            return TerminationReason::MemoryLimit;
+        }
+
+        if state.aborted.load(Ordering::SeqCst) {
+            return TerminationReason::Aborted;
+        }
+
+        if e.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
+            return TerminationReason::CpuTimeLimit;
+        }
+
+        if state.deadline.is_some_and(|d| Instant::now() >= d) {
+            return TerminationReason::WallClockTimeout;
+        }
+
+        TerminationReason::Exception(format!("{} failed: {}", context, e))
     }
 
     /// Convert HttpRequest to WIT HttpRequest
@@ -401,8 +528,12 @@ impl WasmWorker {
     }
 
     /// Abort the worker
+    ///
+    /// Interrupts running guest code at the next epoch check; the epoch bump
+    /// makes that immediate instead of waiting for the next ticker interval.
     pub fn abort(&mut self) {
         self.aborted.store(true, Ordering::SeqCst);
+        self.engine.increment_epoch();
     }
 }
 

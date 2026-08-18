@@ -28,6 +28,22 @@ impl Guest for HelloWorker {
             return proxy_upstream();
         }
 
+        // Limit-testing endpoints
+        if request.url.contains("/spin") {
+            loop {
+                std::hint::black_box(0);
+            }
+        }
+
+        if request.url.contains("/alloc") {
+            let mut hog: Vec<Vec<u8>> = Vec::new();
+
+            loop {
+                hog.push(vec![0u8; 1 << 20]);
+                std::hint::black_box(&hog);
+            }
+        }
+
         // Get greeting from env or use default
         let greeting = host::get_env("GREETING").unwrap_or_else(|| "Hello".to_string());
 

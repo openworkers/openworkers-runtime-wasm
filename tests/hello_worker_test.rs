@@ -1,8 +1,20 @@
 //! Integration test for hello-worker WASM module
 
-use openworkers_core::{Event, HttpMethod, HttpRequest, RequestBody, Script, WorkerCode};
+use openworkers_core::{
+    Event, HttpMethod, HttpRequest, RequestBody, RuntimeLimits, Script, TerminationReason,
+    WorkerCode,
+};
 use openworkers_runtime_wasm::WasmWorker;
 use std::collections::HashMap;
+
+fn get_request(url: &str) -> HttpRequest {
+    HttpRequest {
+        url: url.to_string(),
+        method: HttpMethod::Get,
+        headers: HashMap::new(),
+        body: RequestBody::None,
+    }
+}
 
 /// Load the hello-worker WASM component
 fn load_hello_worker_wasm() -> Vec<u8> {
@@ -115,6 +127,83 @@ async fn test_hello_worker_proxy_without_ops() {
     } else {
         panic!("Expected Bytes response body");
     }
+}
+
+#[tokio::test]
+async fn test_infinite_loop_hits_wall_clock_limit() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let limits = RuntimeLimits {
+        max_cpu_time_ms: 0,
+        max_wall_clock_time_ms: 200,
+        ..Default::default()
+    };
+
+    let mut worker = WasmWorker::new(script, Some(limits), None)
+        .await
+        .expect("Failed to create worker");
+
+    let start = std::time::Instant::now();
+    let (event, _rx) = Event::fetch(get_request("https://example.com/spin"));
+    let result = worker.exec(event).await;
+
+    assert_eq!(result, Err(TerminationReason::WallClockTimeout));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "Worker should be interrupted promptly, took {:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn test_infinite_loop_hits_cpu_fuel_limit() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let limits = RuntimeLimits {
+        max_cpu_time_ms: 50,
+        ..Default::default()
+    };
+
+    let mut worker = WasmWorker::new(script, Some(limits), None)
+        .await
+        .expect("Failed to create worker");
+
+    let (event, _rx) = Event::fetch(get_request("https://example.com/spin"));
+    let result = worker.exec(event).await;
+
+    assert_eq!(result, Err(TerminationReason::CpuTimeLimit));
+}
+
+#[tokio::test]
+async fn test_memory_hog_hits_memory_limit() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let limits = RuntimeLimits {
+        heap_max_mb: 16,
+        max_cpu_time_ms: 0,
+        ..Default::default()
+    };
+
+    let mut worker = WasmWorker::new(script, Some(limits), None)
+        .await
+        .expect("Failed to create worker");
+
+    let (event, _rx) = Event::fetch(get_request("https://example.com/alloc"));
+    let result = worker.exec(event).await;
+
+    assert_eq!(result, Err(TerminationReason::MemoryLimit));
 }
 
 /// Reports per-request exec latency; run with --nocapture to see the numbers
