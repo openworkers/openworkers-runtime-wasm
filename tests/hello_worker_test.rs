@@ -1,6 +1,6 @@
 //! Integration test for hello-worker WASM module
 
-use openworkers_core::{HttpMethod, HttpRequest, RequestBody, Script, Task, WorkerCode};
+use openworkers_core::{Event, HttpMethod, HttpRequest, RequestBody, Script, WorkerCode};
 use openworkers_runtime_wasm::WasmWorker;
 use std::collections::HashMap;
 
@@ -44,9 +44,9 @@ async fn test_hello_worker_fetch() {
         body: RequestBody::None,
     };
 
-    // Execute task
-    let (task, rx) = Task::fetch(request);
-    worker.exec(task).await.expect("Failed to execute task");
+    // Execute event
+    let (event, rx) = Event::fetch(request);
+    worker.exec(event).await.expect("Failed to execute event");
 
     // Get response
     let response = rx.await.expect("Failed to receive response");
@@ -91,9 +91,10 @@ async fn test_hello_worker_scheduled() {
         .expect("Failed to create worker");
 
     // Execute scheduled task
-    let (task, rx) = Task::scheduled(1234567890);
-    worker.exec(task).await.expect("Failed to execute task");
+    let (event, rx) = Event::from_schedule("test-task".to_string(), 1234567890);
+    worker.exec(event).await.expect("Failed to execute event");
 
     // Should complete successfully
-    rx.await.expect("Scheduled task should complete");
+    let result = rx.await.expect("Scheduled task should complete");
+    assert!(result.success, "Task result should be successful");
 }

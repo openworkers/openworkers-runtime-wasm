@@ -3,8 +3,8 @@
 //! Uses WIT (WebAssembly Interface Types) for type-safe host/guest communication.
 
 use openworkers_core::{
-    HttpMethod, HttpRequest, HttpResponse, OperationsHandle, RequestBody, ResponseBody,
-    RuntimeLimits, Script, Task, TerminationReason, WorkerCode,
+    Event, HttpMethod, HttpRequest, HttpResponse, OperationsHandle, RequestBody, ResponseBody,
+    RuntimeLimits, Script, TaskResult, TaskSource, TerminationReason, WorkerCode,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -227,14 +227,14 @@ impl WasmWorker {
         })
     }
 
-    /// Execute a task
-    pub async fn exec(&mut self, task: Task) -> Result<(), TerminationReason> {
+    /// Execute an event
+    pub async fn exec(&mut self, event: Event) -> Result<(), TerminationReason> {
         if self.aborted.load(Ordering::SeqCst) {
             return Err(TerminationReason::Aborted);
         }
 
-        match task {
-            Task::Fetch(mut init) => {
+        match event {
+            Event::Fetch(mut init) => {
                 let fetch_init = init.take().ok_or(TerminationReason::Other(
                     "FetchInit already consumed".to_string(),
                 ))?;
@@ -243,14 +243,28 @@ impl WasmWorker {
                 let _ = fetch_init.res_tx.send(response);
                 Ok(())
             }
-            Task::Scheduled(mut init) => {
-                let scheduled_init = init.take().ok_or(TerminationReason::Other(
-                    "ScheduledInit already consumed".to_string(),
+            Event::Task(mut init) => {
+                let task_init = init.take().ok_or(TerminationReason::Other(
+                    "TaskInit already consumed".to_string(),
                 ))?;
 
-                self.handle_scheduled(scheduled_init.time).await?;
-                let _ = scheduled_init.res_tx.send(());
-                Ok(())
+                // The WIT world only exposes handle-scheduled(time), so
+                // non-schedule sources pass 0.
+                let scheduled_time = match &task_init.source {
+                    Some(TaskSource::Schedule { time }) => *time,
+                    _ => 0,
+                };
+
+                match self.handle_scheduled(scheduled_time).await {
+                    Ok(()) => {
+                        let _ = task_init.res_tx.send(TaskResult::success());
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = task_init.res_tx.send(TaskResult::err(e.to_string()));
+                        Err(e)
+                    }
+                }
             }
         }
     }
@@ -284,7 +298,7 @@ impl WasmWorker {
             })?;
 
         // Convert HttpRequest to WIT types
-        let wit_request = self.to_wit_request(request);
+        let wit_request = self.to_wit_request(request)?;
 
         // Call the handler
         let wit_response = worker
@@ -342,7 +356,10 @@ impl WasmWorker {
     }
 
     /// Convert HttpRequest to WIT HttpRequest
-    fn to_wit_request(&self, request: &HttpRequest) -> WitHttpRequest {
+    ///
+    /// Streaming request bodies are rejected: the WIT interface only carries
+    /// buffered bodies (`option<list<u8>>`).
+    fn to_wit_request(&self, request: &HttpRequest) -> Result<WitHttpRequest, TerminationReason> {
         let method = match request.method {
             openworkers_core::HttpMethod::Get => WitHttpMethod::Get,
             openworkers_core::HttpMethod::Post => WitHttpMethod::Post,
@@ -362,14 +379,19 @@ impl WasmWorker {
         let body = match &request.body {
             RequestBody::None => None,
             RequestBody::Bytes(b) => Some(b.to_vec()),
+            RequestBody::Stream(_) => {
+                return Err(TerminationReason::Other(
+                    "streaming request bodies are not supported by the WASM runtime".to_string(),
+                ));
+            }
         };
 
-        WitHttpRequest {
+        Ok(WitHttpRequest {
             method,
             url: request.url.clone(),
             headers,
             body,
-        }
+        })
     }
 
     /// Convert WIT HttpResponse to HttpResponse
@@ -400,8 +422,8 @@ impl openworkers_core::Worker for WasmWorker {
         WasmWorker::new(script, limits, None).await
     }
 
-    async fn exec(&mut self, task: Task) -> Result<(), TerminationReason> {
-        WasmWorker::exec(self, task).await
+    async fn exec(&mut self, event: Event) -> Result<(), TerminationReason> {
+        WasmWorker::exec(self, event).await
     }
 
     fn abort(&mut self) {
