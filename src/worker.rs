@@ -9,14 +9,15 @@ use openworkers_core::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use wasmtime::component::{Component, Linker, ResourceTable, bindgen};
+use wasmtime::component::{Component, HasSelf, Linker, ResourceTable, bindgen};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 // Generate bindings from the WIT file
 bindgen!({
     path: "wit/worker.wit",
-    async: true,
+    imports: { default: async },
+    exports: { default: async },
 });
 
 // Re-export the generated types for convenience
@@ -64,12 +65,11 @@ impl WasmState {
 
 // Implement WasiView for WASI support
 impl WasiView for WasmState {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
     }
 }
 
@@ -281,14 +281,14 @@ impl WasmWorker {
         let mut linker = Linker::new(&self.engine);
 
         // Add WASI to the linker
-        wasmtime_wasi::add_to_linker_async(&mut linker).map_err(|e| {
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| {
             TerminationReason::InitializationError(format!("Failed to add WASI to linker: {}", e))
         })?;
 
         // Add our custom host functions
-        Worker::add_to_linker(&mut linker, |state: &mut WasmState| state).map_err(|e| {
-            TerminationReason::InitializationError(format!("Failed to add to linker: {}", e))
-        })?;
+        Worker::add_to_linker::<_, HasSelf<WasmState>>(&mut linker, |state| state).map_err(
+            |e| TerminationReason::InitializationError(format!("Failed to add to linker: {}", e)),
+        )?;
 
         // Instantiate the component
         let worker = Worker::instantiate_async(&mut store, &self.component, &linker)
@@ -317,13 +317,13 @@ impl WasmWorker {
 
         let mut linker = Linker::new(&self.engine);
 
-        wasmtime_wasi::add_to_linker_async(&mut linker).map_err(|e| {
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| {
             TerminationReason::InitializationError(format!("Failed to add WASI to linker: {}", e))
         })?;
 
-        Worker::add_to_linker(&mut linker, |state: &mut WasmState| state).map_err(|e| {
-            TerminationReason::InitializationError(format!("Failed to add to linker: {}", e))
-        })?;
+        Worker::add_to_linker::<_, HasSelf<WasmState>>(&mut linker, |state| state).map_err(
+            |e| TerminationReason::InitializationError(format!("Failed to add to linker: {}", e)),
+        )?;
 
         let worker = Worker::instantiate_async(&mut store, &self.component, &linker)
             .await

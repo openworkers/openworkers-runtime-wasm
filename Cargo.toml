@@ -12,8 +12,8 @@ license = "Apache-2.0"
 openworkers-core = { git = "https://github.com/openworkers/openworkers-core", tag = "v0.14.0", features = ["wasm"] }
 
 # Wasmtime runtime with component model and WASI support
-wasmtime = { version = "29", features = ["component-model"] }
-wasmtime-wasi = "29"
+wasmtime = { version = "47", features = ["component-model"] }
+wasmtime-wasi = "47"
 
 # Async runtime
 tokio = { version = "1", features = ["sync", "time", "rt"] }
