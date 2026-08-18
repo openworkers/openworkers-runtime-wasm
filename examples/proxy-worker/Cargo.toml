@@ -1,5 +1,5 @@
 [package]
-name = "hello-worker"
+name = "proxy-worker"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.60"
+wasi = "0.14"
 
 [profile.release]
 opt-level = "s"

@@ -1,62 +1,21 @@
-package openworkers:worker@0.1.0;
+package openworkers:worker@0.2.0;
 
-/// Shared types for HTTP handling
-interface types {
-    /// HTTP method
-    enum http-method {
-        get,
-        post,
-        put,
-        delete,
-        patch,
-        head,
-        options,
-    }
-
-    /// HTTP request from the runtime to the worker
-    record http-request {
-        method: http-method,
-        url: string,
-        headers: list<tuple<string, string>>,
-        body: option<list<u8>>,
-    }
-
-    /// HTTP response from the worker to the runtime
-    record http-response {
-        status: u16,
-        headers: list<tuple<string, string>>,
-        body: option<list<u8>>,
-    }
-}
-
-/// Host functions available to workers
-interface host {
-    use types.{http-request, http-response};
-
-    /// Log a message at the specified level (0=debug, 1=info, 2=warn, 3=error)
-    log: func(level: u8, message: string);
-
-    /// Get an environment variable, returns none if not set
-    get-env: func(key: string) -> option<string>;
-
-    /// Fetch a URL (outbound HTTP request)
-    /// Returns the response or an error string
-    fetch: func(request: http-request) -> result<http-response, string>;
-}
-
-/// Worker interface that guests must implement
-interface handler {
-    use types.{http-request, http-response};
-
-    /// Handle an HTTP fetch event
-    handle-fetch: func(request: http-request) -> http-response;
-
-    /// Handle a scheduled event (cron)
+/// Cron entry point; wasi:http/proxy has no equivalent for it
+interface scheduled {
+    /// Handle a scheduled event (unix timestamp in ms)
     handle-scheduled: func(scheduled-time: u64);
 }
 
-/// The world that workers implement
+/// Full OpenWorkers guest: the standard wasi:http proxy plus cron.
+/// Guests that only serve HTTP can target wasi:http/proxy directly and
+/// run unmodified; the scheduled export is then simply absent.
 world worker {
-    import host;
-    export handler;
+    include wasi:http/proxy@0.2.12;
+    export scheduled;
+}
+
+/// Host-side view of the cron export alone; the HTTP side is bound
+/// through the wasi:http host implementation
+world scheduled-only {
+    export scheduled;
 }

@@ -1,19 +1,45 @@
 //! WebAssembly Worker implementation using Wasmtime Component Model
 //!
-//! Uses WIT (WebAssembly Interface Types) for type-safe host/guest communication.
+//! HTTP guests implement the standard wasi:http/proxy world; the cron entry
+//! point comes from the custom `openworkers:worker/scheduled` interface.
 
+use http_body_util::BodyExt;
+use http_body_util::Full;
 use openworkers_core::{
     Event, HttpMethod, HttpRequest, HttpResponse, LogLevel, OperationsHandle, RequestBody,
     ResponseBody, RuntimeLimits, Script, TaskResult, TaskSource, TerminationReason, WorkerCode,
 };
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Context;
+use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
-use wasmtime::component::{Component, HasSelf, Linker, ResourceTable, bindgen};
+use wasmtime::component::{Component, Linker, ResourceTable, bindgen};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, Trap, UpdateDeadline};
+use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::p2::HttpResult;
+use wasmtime_wasi_http::p2::WasiHttpCtxView;
+use wasmtime_wasi_http::p2::WasiHttpHooks;
+use wasmtime_wasi_http::p2::WasiHttpView;
+use wasmtime_wasi_http::p2::bindings::ProxyPre;
+use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
+use wasmtime_wasi_http::p2::body::{HyperIncomingBody, HyperOutgoingBody};
+use wasmtime_wasi_http::p2::types::{
+    HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig,
+};
+
+// The wasi:http side is covered by wasmtime-wasi-http's own Proxy bindings
+bindgen!({
+    path: "wit",
+    world: "scheduled-only",
+    exports: { default: async },
+});
 
 /// Interval of the background thread driving epoch interruption; also the
 /// granularity of wall-clock and abort checks
@@ -23,39 +49,27 @@ const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// this assumes 10k instructions per ms. Not calibrated against real hardware.
 const FUEL_UNITS_PER_MS: u64 = 10_000;
 
-// Generate bindings from the WIT file
-bindgen!({
-    path: "wit/worker.wit",
-    imports: { default: async },
-    exports: { default: async },
-});
-
-// Re-export the generated types for convenience
-use openworkers::worker::types::{
-    HttpMethod as WitHttpMethod, HttpRequest as WitHttpRequest, HttpResponse as WitHttpResponse,
-};
-
 /// State held by each WASM instance
 pub struct WasmState {
     /// WASI context
     wasi: WasiCtx,
+    /// wasi:http context
+    http: WasiHttpCtx,
     /// Resource table (required by wasmtime component model)
     table: ResourceTable,
-    /// Environment variables (for our custom host interface)
-    env: HashMap<String, String>,
     /// Abort flag
     aborted: Arc<AtomicBool>,
-    /// Operations handle for fetch, KV, etc. (delegated to runner)
-    ops: Option<OperationsHandle>,
     /// Wall-clock deadline for this execution (None = no limit)
     deadline: Option<Instant>,
     /// Memory limiter enforcing heap_max_mb
     limiter: MemoryLimiter,
+    /// Outbound request routing (through the runner's ops handler)
+    hooks: OpsHooks,
 }
 
 impl WasmState {
     fn new(
-        env: HashMap<String, String>,
+        env: &HashMap<String, String>,
         aborted: Arc<AtomicBool>,
         ops: Option<OperationsHandle>,
         deadline: Option<Instant>,
@@ -64,21 +78,59 @@ impl WasmState {
         // Build WASI context with environment variables
         let mut wasi_builder = WasiCtxBuilder::new();
 
-        for (k, v) in &env {
+        for (k, v) in env {
             wasi_builder.env(k, v);
+        }
+
+        // Guest stdout/stderr are the log channel; without ops they go to
+        // the host process output
+        match &ops {
+            Some(ops) => {
+                wasi_builder.stdout(OpsLogStream {
+                    level: LogLevel::Info,
+                    ops: ops.clone(),
+                });
+                wasi_builder.stderr(OpsLogStream {
+                    level: LogLevel::Error,
+                    ops: ops.clone(),
+                });
+            }
+            None => {
+                wasi_builder.inherit_stdout();
+                wasi_builder.inherit_stderr();
+            }
         }
 
         Self {
             wasi: wasi_builder.build(),
+            http: WasiHttpCtx::new(),
             table: ResourceTable::new(),
-            env,
             aborted,
-            ops,
             deadline,
             limiter: MemoryLimiter {
                 max_memory_bytes,
                 memory_limit_hit: false,
             },
+            hooks: OpsHooks { ops },
+        }
+    }
+}
+
+impl WasiView for WasmState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+impl WasiHttpView for WasmState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.hooks,
         }
     }
 }
@@ -116,109 +168,187 @@ impl ResourceLimiter for MemoryLimiter {
     }
 }
 
-// Implement WasiView for WASI support
-impl WasiView for WasmState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
+/// Routes the guest's wasi:http/outgoing-handler calls to the runner
+struct OpsHooks {
+    ops: Option<OperationsHandle>,
+}
+
+impl WasiHttpHooks for OpsHooks {
+    fn send_request(
+        &mut self,
+        request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
+    ) -> HttpResult<HostFutureIncomingResponse> {
+        let Some(ops) = self.ops.clone() else {
+            return Err(ErrorCode::InternalError(Some(
+                "fetch not available: no operations handle".to_string(),
+            ))
+            .into());
+        };
+
+        Ok(HostFutureIncomingResponse::pending(
+            wasmtime_wasi::runtime::spawn(async move {
+                Ok(ops_send_request(ops, request, config).await)
+            }),
+        ))
     }
 }
 
-// Implement the host interface for WasmState
-impl openworkers::worker::host::Host for WasmState {
-    async fn log(&mut self, level: u8, message: String) {
-        let level = match level {
-            0 => LogLevel::Debug,
-            1 => LogLevel::Info,
-            2 => LogLevel::Warn,
-            3 => LogLevel::Error,
-            _ => LogLevel::Log,
-        };
+/// Buffer the outgoing request, run it through ops.handle_fetch, and buffer
+/// the response back into a wasi:http incoming response
+async fn ops_send_request(
+    ops: OperationsHandle,
+    request: hyper::Request<HyperOutgoingBody>,
+    config: OutgoingRequestConfig,
+) -> Result<IncomingResponse, ErrorCode> {
+    let (parts, body) = request.into_parts();
 
-        match &self.ops {
-            Some(ops) => ops.handle_log(level, message),
-            None => println!("[WASM {}] {}", level, message),
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|e| ErrorCode::InternalError(Some(format!("request body failed: {}", e))))?
+        .to_bytes();
+
+    let method: HttpMethod = parts
+        .method
+        .as_str()
+        .parse()
+        .map_err(|_| ErrorCode::HttpRequestMethodInvalid)?;
+
+    let mut headers = HashMap::new();
+
+    for (name, value) in &parts.headers {
+        if let Ok(value) = value.to_str() {
+            headers.insert(name.to_string(), value.to_string());
         }
     }
 
-    async fn get_env(&mut self, key: String) -> Option<String> {
-        self.env.get(&key).cloned()
+    let core_request = HttpRequest {
+        method,
+        url: parts.uri.to_string(),
+        headers,
+        body: if body_bytes.is_empty() {
+            RequestBody::None
+        } else {
+            RequestBody::Bytes(body_bytes)
+        },
+    };
+
+    let response = ops
+        .handle_fetch(core_request)
+        .await
+        .map_err(|e| ErrorCode::InternalError(Some(format!("fetch failed: {}", e))))?;
+
+    let mut builder = hyper::Response::builder().status(response.status);
+
+    for (name, value) in response.headers {
+        builder = builder.header(name, value);
     }
 
-    async fn fetch(&mut self, request: WitHttpRequest) -> Result<WitHttpResponse, String> {
-        let ops = self
-            .ops
-            .as_ref()
-            .ok_or_else(|| "fetch not available: no operations handle".to_string())?;
+    let body_bytes = response.body.collect().await.unwrap_or_default();
 
-        // Convert WIT request to core HttpRequest
-        let method = match request.method {
-            WitHttpMethod::Get => HttpMethod::Get,
-            WitHttpMethod::Post => HttpMethod::Post,
-            WitHttpMethod::Put => HttpMethod::Put,
-            WitHttpMethod::Delete => HttpMethod::Delete,
-            WitHttpMethod::Patch => HttpMethod::Patch,
-            WitHttpMethod::Head => HttpMethod::Head,
-            WitHttpMethod::Options => HttpMethod::Options,
-        };
+    let resp = builder
+        .body(full_body(body_bytes))
+        .map_err(|e| ErrorCode::InternalError(Some(format!("invalid response: {}", e))))?;
 
-        let body = match request.body {
-            None => RequestBody::None,
-            Some(bytes) => RequestBody::Bytes(bytes::Bytes::from(bytes)),
-        };
+    Ok(IncomingResponse {
+        resp,
+        worker: None,
+        between_bytes_timeout: config.between_bytes_timeout,
+    })
+}
 
-        let headers: HashMap<String, String> = request.headers.into_iter().collect();
+/// A buffered hyper body with the error type wasi:http expects
+fn full_body(bytes: bytes::Bytes) -> HyperIncomingBody {
+    Full::new(bytes).map_err(|e| match e {}).boxed_unsync()
+}
 
-        let core_request = HttpRequest {
-            method,
-            url: request.url,
-            headers,
-            body,
-        };
+/// Guest stdout/stderr sink forwarding complete lines to the ops handler
+struct OpsLogStream {
+    level: LogLevel,
+    ops: OperationsHandle,
+}
 
-        // Delegate to runner via OperationsHandle
-        let response = ops
-            .handle_fetch(core_request)
-            .await
-            .map_err(|e| format!("fetch failed: {}", e))?;
+impl IsTerminal for OpsLogStream {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
 
-        // Convert core HttpResponse to WIT response
-        // Note: Streams are not supported in WASM - they would require async iteration
-        let body = match response.body {
-            ResponseBody::None => None,
-            ResponseBody::Bytes(b) => Some(b.to_vec()),
-            ResponseBody::Stream(_) => {
-                return Err("streaming responses not supported in WASM".to_string());
-            }
-        };
-
-        Ok(WitHttpResponse {
-            status: response.status,
-            headers: response.headers,
-            body,
+impl StdoutStream for OpsLogStream {
+    fn async_stream(&self) -> Box<dyn tokio::io::AsyncWrite + Send + Sync> {
+        Box::new(OpsLogWriter {
+            level: self.level,
+            ops: self.ops.clone(),
+            buffer: Vec::new(),
         })
     }
 }
 
-// Implement the types interface (required even if it only has types)
-impl openworkers::worker::types::Host for WasmState {}
+struct OpsLogWriter {
+    level: LogLevel,
+    ops: OperationsHandle,
+    /// Bytes of the current, not yet newline-terminated line
+    buffer: Vec<u8>,
+}
+
+impl OpsLogWriter {
+    fn emit(&self, line: &[u8]) {
+        self.ops
+            .handle_log(self.level, String::from_utf8_lossy(line).into_owned());
+    }
+}
+
+impl tokio::io::AsyncWrite for OpsLogWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.buffer.extend_from_slice(buf);
+
+        while let Some(pos) = this.buffer.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = this.buffer.drain(..=pos).collect();
+            this.emit(&line[..line.len() - 1]);
+        }
+
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for OpsLogWriter {
+    fn drop(&mut self) {
+        if !self.buffer.is_empty() {
+            let line = std::mem::take(&mut self.buffer);
+            self.emit(&line);
+        }
+    }
+}
 
 /// WebAssembly Worker using Wasmtime Component Model
 pub struct WasmWorker {
     /// Wasmtime engine (can be shared across workers)
     engine: Engine,
-    /// Pre-instantiated component: compilation and import resolution are done
-    /// once here, so per-request instantiation only allocates the instance
-    instance_pre: WorkerPre<WasmState>,
+    /// Pre-instantiated wasi:http/incoming-handler (None if not exported)
+    proxy_pre: Option<ProxyPre<WasmState>>,
+    /// Pre-instantiated scheduled handler (None if not exported)
+    scheduled_pre: Option<ScheduledOnlyPre<WasmState>>,
     /// Runtime limits
     limits: RuntimeLimits,
     /// Abort flag
     aborted: Arc<AtomicBool>,
     /// Environment variables from script
     env: HashMap<String, String>,
-    /// Operations handle for fetch, KV, etc. (delegated to runner)
+    /// Operations handle for fetch, log, etc. (delegated to runner)
     ops: Option<OperationsHandle>,
 }
 
@@ -297,23 +427,36 @@ impl WasmWorker {
             TerminationReason::InitializationError(format!("Failed to add WASI to linker: {}", e))
         })?;
 
-        Worker::add_to_linker::<_, HasSelf<WasmState>>(&mut linker, |state| state).map_err(
-            |e| TerminationReason::InitializationError(format!("Failed to add to linker: {}", e)),
-        )?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|e| {
+            TerminationReason::InitializationError(format!(
+                "Failed to add wasi:http to linker: {}",
+                e
+            ))
+        })?;
 
-        let instance_pre = linker
-            .instantiate_pre(&component)
-            .and_then(WorkerPre::new)
-            .map_err(|e| {
-                TerminationReason::InitializationError(format!(
-                    "Failed to pre-instantiate component: {}",
-                    e
-                ))
-            })?;
+        let instance_pre = linker.instantiate_pre(&component).map_err(|e| {
+            TerminationReason::InitializationError(format!(
+                "Failed to pre-instantiate component: {}",
+                e
+            ))
+        })?;
+
+        // A guest may export the HTTP handler, the scheduled handler, or both
+        let proxy_pre = ProxyPre::new(instance_pre.clone()).ok();
+        let scheduled_pre = ScheduledOnlyPre::new(instance_pre).ok();
+
+        if proxy_pre.is_none() && scheduled_pre.is_none() {
+            return Err(TerminationReason::InitializationError(
+                "component exports neither wasi:http/incoming-handler nor \
+                 openworkers:worker/scheduled"
+                    .to_string(),
+            ));
+        }
 
         Ok(Self {
             engine,
-            instance_pre,
+            proxy_pre,
+            scheduled_pre,
             limits,
             aborted: Arc::new(AtomicBool::new(false)),
             env: script.env.unwrap_or_default(),
@@ -333,7 +476,7 @@ impl WasmWorker {
                     "FetchInit already consumed".to_string(),
                 ))?;
 
-                let response = self.handle_fetch(&fetch_init.req).await?;
+                let response = self.handle_fetch(fetch_init.req).await?;
                 let _ = fetch_init.res_tx.send(response);
                 Ok(())
             }
@@ -342,7 +485,7 @@ impl WasmWorker {
                     "TaskInit already consumed".to_string(),
                 ))?;
 
-                // The WIT world only exposes handle-scheduled(time), so
+                // The scheduled export only carries a timestamp, so
                 // non-schedule sources pass 0.
                 let scheduled_time = match &task_init.source {
                     Some(TaskSource::Schedule { time }) => *time,
@@ -363,35 +506,143 @@ impl WasmWorker {
         }
     }
 
-    /// Handle a fetch event
+    /// Handle a fetch event through wasi:http/incoming-handler
     async fn handle_fetch(
         &mut self,
-        request: &HttpRequest,
+        request: HttpRequest,
     ) -> Result<HttpResponse, TerminationReason> {
-        let (mut store, worker) = self.instantiate().await?;
+        let Some(proxy_pre) = &self.proxy_pre else {
+            return Err(TerminationReason::Other(
+                "guest does not export wasi:http/incoming-handler".to_string(),
+            ));
+        };
 
-        // Convert HttpRequest to WIT types
-        let wit_request = self.to_wit_request(request)?;
+        let mut store = self.create_store();
 
-        // Call the handler
-        let call_result = worker
-            .openworkers_worker_handler()
-            .call_handle_fetch(&mut store, &wit_request)
-            .await;
+        let proxy = match proxy_pre.instantiate_async(&mut store).await {
+            Ok(proxy) => proxy,
+            Err(e) => return Err(Self::termination_reason(&store, "instantiate", e)),
+        };
 
-        let wit_response =
-            call_result.map_err(|e| Self::termination_reason(&store, "handle_fetch", e))?;
+        let scheme = if request.url.starts_with("https://") {
+            Scheme::Https
+        } else {
+            Scheme::Http
+        };
 
-        // Convert response back
-        Ok(self.from_wit_response(wit_response))
+        let mut builder = hyper::Request::builder()
+            .method(request.method.as_str())
+            .uri(&request.url);
+
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+
+        // Streaming request bodies are buffered here; pass-through streaming
+        // is not implemented yet
+        let body_bytes = request.body.collect().await.unwrap_or_default();
+
+        let hyper_request = builder.body(full_body(body_bytes)).map_err(|e| {
+            TerminationReason::Other(format!("could not build guest request: {}", e))
+        })?;
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        let (guest_request, guest_response_out) = {
+            let mut http = store.data_mut().http();
+
+            let guest_request = http
+                .new_incoming_request(scheme, hyper_request)
+                .map_err(|e| {
+                    TerminationReason::Other(format!("could not create guest request: {}", e))
+                })?;
+
+            let guest_response_out = http.new_response_outparam(response_tx).map_err(|e| {
+                TerminationReason::Other(format!("could not create response channel: {}", e))
+            })?;
+
+            (guest_request, guest_response_out)
+        };
+
+        // Run the guest concurrently with response collection: the guest may
+        // still be streaming the body when the response head arrives
+        let guest_task = wasmtime_wasi::runtime::spawn(async move {
+            let result = proxy
+                .wasi_http_incoming_handler()
+                .call_handle(&mut store, guest_request, guest_response_out)
+                .await;
+
+            result.map_err(|e| Self::termination_reason(&store, "handle", e))
+        });
+
+        match response_rx.await {
+            Ok(Ok(response)) => {
+                let (parts, body) = response.into_parts();
+
+                let mut headers = Vec::new();
+
+                for (name, value) in &parts.headers {
+                    if let Ok(value) = value.to_str() {
+                        headers.push((name.to_string(), value.to_string()));
+                    }
+                }
+
+                let body = match body.collect().await {
+                    Ok(collected) => {
+                        let bytes = collected.to_bytes();
+
+                        if bytes.is_empty() {
+                            ResponseBody::None
+                        } else {
+                            ResponseBody::Bytes(bytes)
+                        }
+                    }
+                    Err(e) => {
+                        return Err(match guest_task.await {
+                            Err(reason) => reason,
+                            Ok(()) => {
+                                TerminationReason::Exception(format!("response body failed: {}", e))
+                            }
+                        });
+                    }
+                };
+
+                Ok(HttpResponse {
+                    status: parts.status.as_u16(),
+                    headers,
+                    body,
+                })
+            }
+            Ok(Err(code)) => Err(TerminationReason::Exception(format!(
+                "guest rejected request: {}",
+                code
+            ))),
+            Err(_) => match guest_task.await {
+                Err(reason) => Err(reason),
+                Ok(()) => Err(TerminationReason::Exception(
+                    "guest returned without producing a response".to_string(),
+                )),
+            },
+        }
     }
 
     /// Handle a scheduled event
     async fn handle_scheduled(&mut self, time: u64) -> Result<(), TerminationReason> {
-        let (mut store, worker) = self.instantiate().await?;
+        let Some(scheduled_pre) = &self.scheduled_pre else {
+            return Err(TerminationReason::Other(
+                "guest does not export openworkers:worker/scheduled".to_string(),
+            ));
+        };
 
-        let call_result = worker
-            .openworkers_worker_handler()
+        let mut store = self.create_store();
+
+        let guest = match scheduled_pre.instantiate_async(&mut store).await {
+            Ok(guest) => guest,
+            Err(e) => return Err(Self::termination_reason(&store, "instantiate", e)),
+        };
+
+        let call_result = guest
+            .openworkers_worker_scheduled()
             .call_handle_scheduled(&mut store, time)
             .await;
 
@@ -400,13 +651,13 @@ impl WasmWorker {
         Ok(())
     }
 
-    /// Create a fresh store and instantiate the pre-linked component in it
-    async fn instantiate(&self) -> Result<(Store<WasmState>, Worker), TerminationReason> {
+    /// Create a fresh store with limits armed
+    fn create_store(&self) -> Store<WasmState> {
         let deadline = (self.limits.max_wall_clock_time_ms > 0)
             .then(|| Instant::now() + Duration::from_millis(self.limits.max_wall_clock_time_ms));
 
         let state = WasmState::new(
-            self.env.clone(),
+            &self.env,
             self.aborted.clone(),
             self.ops.clone(),
             deadline,
@@ -439,12 +690,7 @@ impl WasmWorker {
             Ok(UpdateDeadline::Continue(1))
         });
 
-        let worker = match self.instance_pre.instantiate_async(&mut store).await {
-            Ok(worker) => worker,
-            Err(e) => return Err(Self::termination_reason(&store, "instantiate", e)),
-        };
-
-        Ok((store, worker))
+        store
     }
 
     /// Map a failed guest call to a TerminationReason using the store state
@@ -474,61 +720,6 @@ impl WasmWorker {
         }
 
         TerminationReason::Exception(format!("{} failed: {}", context, e))
-    }
-
-    /// Convert HttpRequest to WIT HttpRequest
-    ///
-    /// Streaming request bodies are rejected: the WIT interface only carries
-    /// buffered bodies (`option<list<u8>>`).
-    fn to_wit_request(&self, request: &HttpRequest) -> Result<WitHttpRequest, TerminationReason> {
-        let method = match request.method {
-            openworkers_core::HttpMethod::Get => WitHttpMethod::Get,
-            openworkers_core::HttpMethod::Post => WitHttpMethod::Post,
-            openworkers_core::HttpMethod::Put => WitHttpMethod::Put,
-            openworkers_core::HttpMethod::Delete => WitHttpMethod::Delete,
-            openworkers_core::HttpMethod::Patch => WitHttpMethod::Patch,
-            openworkers_core::HttpMethod::Head => WitHttpMethod::Head,
-            openworkers_core::HttpMethod::Options => WitHttpMethod::Options,
-        };
-
-        let headers: Vec<(String, String)> = request
-            .headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        let body = match &request.body {
-            RequestBody::None => None,
-            RequestBody::Bytes(b) => Some(b.to_vec()),
-            RequestBody::Stream(_) => {
-                return Err(TerminationReason::Other(
-                    "streaming request bodies are not supported by the WASM runtime".to_string(),
-                ));
-            }
-        };
-
-        Ok(WitHttpRequest {
-            method,
-            url: request.url.clone(),
-            headers,
-            body,
-        })
-    }
-
-    /// Convert WIT HttpResponse to HttpResponse
-    fn from_wit_response(&self, response: WitHttpResponse) -> HttpResponse {
-        let headers: Vec<(String, String)> = response.headers;
-
-        let body = match response.body {
-            None => ResponseBody::None,
-            Some(bytes) => ResponseBody::Bytes(bytes::Bytes::from(bytes)),
-        };
-
-        HttpResponse {
-            status: response.status,
-            headers,
-            body,
-        }
     }
 
     /// Abort the worker

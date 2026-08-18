@@ -18,17 +18,24 @@ fn get_request(url: &str) -> HttpRequest {
     }
 }
 
-/// Load the hello-worker WASM component
-fn load_hello_worker_wasm() -> Vec<u8> {
-    let wasm_path = concat!(
+/// Load the component built by the given example crate
+fn load_component(example: &str) -> Vec<u8> {
+    let path = format!(
+        "{}/examples/{example}/target/wasm32-wasip2/release/{}.wasm",
         env!("CARGO_MANIFEST_DIR"),
-        "/examples/hello-worker/target/wasm32-wasip2/release/hello_worker.wasm"
+        example.replace('-', "_")
     );
 
-    std::fs::read(wasm_path).expect(&format!(
-        "Failed to read WASM file. Build it first with:\n\
-         cd examples/hello-worker && cargo build --target wasm32-wasip2 --release"
-    ))
+    std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "could not read {path}: {e}\n\
+             build it with: cd examples/{example} && cargo build --target wasm32-wasip2 --release"
+        )
+    })
+}
+
+fn load_hello_worker_wasm() -> Vec<u8> {
+    load_component("hello-worker")
 }
 
 #[tokio::test]
@@ -321,6 +328,88 @@ async fn test_exec_latency_report() {
         elapsed,
         elapsed / ITERATIONS
     );
+}
+
+/// A component built against the unmodified wasi:http/proxy world runs as an
+/// HTTP worker, with no OpenWorkers-specific WIT
+#[tokio::test]
+async fn test_stock_proxy_component_serves_http() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_component("proxy-worker")),
+        env: None,
+        bindings: vec![],
+    };
+
+    let mut worker = WasmWorker::new(script, None, None)
+        .await
+        .expect("Failed to create worker");
+
+    let (event, rx) = Event::fetch(get_request("https://example.com/stock"));
+    worker.exec(event).await.expect("Failed to execute event");
+
+    let response = rx.await.expect("Failed to receive response");
+
+    assert_eq!(response.status, 200);
+
+    let ResponseBody::Bytes(body) = &response.body else {
+        panic!("Expected Bytes response body");
+    };
+
+    assert_eq!(&body[..], b"stock wasi:http proxy answering /stock");
+}
+
+/// A proxy-only component has no scheduled export, so cron events are refused
+#[tokio::test]
+async fn test_stock_proxy_component_has_no_scheduled_handler() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_component("proxy-worker")),
+        env: None,
+        bindings: vec![],
+    };
+
+    let mut worker = WasmWorker::new(script, None, None)
+        .await
+        .expect("Failed to create worker");
+
+    let (event, _rx) = Event::from_schedule("test-task".to_string(), 1234567890);
+
+    assert!(matches!(
+        worker.exec(event).await,
+        Err(TerminationReason::Other(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_request_body_reaches_the_guest() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let mut worker = WasmWorker::new(script, None, None)
+        .await
+        .expect("Failed to create worker");
+
+    let request = HttpRequest {
+        url: "https://example.com/echo".to_string(),
+        method: HttpMethod::Post,
+        headers: HashMap::new(),
+        body: RequestBody::Bytes(bytes::Bytes::from_static(b"round trip")),
+    };
+
+    let (event, rx) = Event::fetch(request);
+    worker.exec(event).await.expect("Failed to execute event");
+
+    let response = rx.await.expect("Failed to receive response");
+
+    assert_eq!(response.status, 200);
+
+    let ResponseBody::Bytes(body) = &response.body else {
+        panic!("Expected Bytes response body");
+    };
+
+    assert_eq!(&body[..], b"round trip");
 }
 
 #[tokio::test]

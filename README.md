@@ -4,7 +4,7 @@ WebAssembly runtime for OpenWorkers using Wasmtime Component Model.
 
 ## Features
 
-- **Component Model**: Type-safe host/guest communication via WIT interfaces
+- **Standard HTTP contract**: guests are `wasi:http/proxy` components
 - **WASI Support**: WebAssembly System Interface (WASIp2)
 - **Multi-language**: Write workers in Rust, Go (TinyGo), C/C++, AssemblyScript
 - **Secure by design**: Capabilities-based sandboxing, no Spectre concerns
@@ -12,60 +12,80 @@ WebAssembly runtime for OpenWorkers using Wasmtime Component Model.
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│            openworkers-runner               │
-└──────────────────┬──────────────────────────┘
-                   │
-┌──────────────────▼──────────────────────────┐
-│          openworkers-runtime-wasm           │
-│  ┌───────────────────────────────────────┐  │
-│  │            Wasmtime                   │  │
-│  │  ┌─────────────────────────────────┐  │  │
-│  │  │     WASM Component (Worker)     │  │  │
-│  │  │  - handle_fetch()               │  │  │
-│  │  │  - handle_scheduled()           │  │  │
-│  │  └─────────────────────────────────┘  │  │
-│  └───────────────────────────────────────┘  │
-└─────────────────────────────────────────────┘
++---------------------------------------------+
+|            openworkers-runner               |
++----------------------+----------------------+
+                       |
++----------------------v----------------------+
+|          openworkers-runtime-wasm           |
+|  +---------------------------------------+  |
+|  |            Wasmtime                   |  |
+|  |  +---------------------------------+  |  |
+|  |  |     WASM Component (Worker)     |  |  |
+|  |  |  - wasi:http/incoming-handler   |  |  |
+|  |  |  - openworkers:worker/scheduled |  |  |
+|  |  +---------------------------------+  |  |
+|  +---------------------------------------+  |
++---------------------------------------------+
 ```
 
-## WIT Interface
+## Interfaces
 
-Workers implement the `handler` interface defined in `wit/worker.wit`:
+A worker is a WASI Preview 2 component that exports
+`wasi:http/incoming-handler`, `openworkers:worker/scheduled`, or both. Any
+component built against the standard `wasi:http/proxy` world runs unmodified;
+`wit/worker.wit` adds the cron entry point on top of it:
 
 ```wit
-interface handler {
-    handle-fetch: func(request: http-request) -> http-response;
-    handle-scheduled: func(scheduled-time: u64);
+world worker {
+    include wasi:http/proxy@0.2.12;
+    export scheduled;
 }
 ```
 
-Host provides:
-- `log(level, message)` - Logging
-- `get-env(key)` - Environment variables
+The host provides:
+
+- `wasi:http/outgoing-handler` - outbound requests, routed to the runner's
+  `OperationsHandler`
+- `wasi:cli/environment` - the worker's environment variables
+- `wasi:cli/stdout` and `wasi:cli/stderr` - guest output, forwarded to the
+  runner's log handler line by line (stdout as info, stderr as error)
+
+Bodies are buffered at the boundary in both directions; streaming pass-through
+is not implemented yet.
 
 ## Writing a Worker (Rust)
 
 ```rust
 wit_bindgen::generate!({
     world: "worker",
-    path: "wit/worker.wit",
+    path: "wit",
+    generate_all,
 });
 
-use exports::openworkers::worker::handler::Guest;
-use openworkers::worker::types::{HttpRequest, HttpResponse};
+use exports::openworkers::worker::scheduled::Guest as ScheduledGuest;
+use exports::wasi::http::incoming_handler::Guest as HttpGuest;
+use wasi::http::types::{Fields, IncomingRequest, OutgoingBody, OutgoingResponse, ResponseOutparam};
 
 struct MyWorker;
 
-impl Guest for MyWorker {
-    fn handle_fetch(request: HttpRequest) -> HttpResponse {
-        HttpResponse {
-            status: 200,
-            headers: vec![("Content-Type".into(), "text/plain".into())],
-            body: Some(b"Hello from WASM!".to_vec()),
-        }
-    }
+impl HttpGuest for MyWorker {
+    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
+        let response = OutgoingResponse::new(Fields::new());
+        let body = response.body().unwrap();
 
+        ResponseOutparam::set(response_out, Ok(response));
+
+        {
+            let stream = body.write().unwrap();
+            stream.blocking_write_and_flush(b"Hello from WASM!").unwrap();
+        }
+
+        OutgoingBody::finish(body, None).unwrap();
+    }
+}
+
+impl ScheduledGuest for MyWorker {
     fn handle_scheduled(scheduled_time: u64) {
         // Handle cron job
     }
@@ -90,7 +110,7 @@ let wasm_bytes = std::fs::read("worker.wasm")?;
 let script = Script::new(WorkerCode::WebAssembly(wasm_bytes));
 
 // Create worker
-let mut worker = WasmWorker::new(script, None).await?;
+let mut worker = WasmWorker::new(script, None, None).await?;
 
 // Execute task
 worker.exec(task).await?;
@@ -98,15 +118,16 @@ worker.exec(task).await?;
 
 ## Examples
 
-See `examples/hello-worker` for a complete example.
+- `examples/hello-worker` - HTTP plus cron, outbound fetch, environment
+- `examples/proxy-worker` - a stock `wasi:http/proxy` component, built from the
+  upstream `wasi` crate with no OpenWorkers-specific WIT
 
 ```bash
-# Build the example
-cd examples/hello-worker
-cargo build --target wasm32-wasip2 --release
+# Build the examples
+(cd examples/hello-worker && cargo build --target wasm32-wasip2 --release)
+(cd examples/proxy-worker && cargo build --target wasm32-wasip2 --release)
 
 # Run tests
-cd ../..
 cargo test
 ```
 
