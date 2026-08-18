@@ -672,7 +672,13 @@ impl WasmWorker {
                 return Ok(UpdateDeadline::Interrupt);
             }
 
-            Ok(UpdateDeadline::Continue(1))
+            // Yield, or a compute-bound guest holds the executor until its
+            // wall-clock budget expires. UpdateDeadline::Yield wakes itself and
+            // lands back in tokio's LIFO slot, so it never reaches the run queue.
+            Ok(UpdateDeadline::YieldCustom(
+                1,
+                Box::pin(tokio::task::yield_now()),
+            ))
         });
 
         store

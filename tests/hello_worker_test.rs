@@ -265,6 +265,57 @@ async fn test_infinite_loop_hits_wall_clock_limit() {
     );
 }
 
+const SPIN_BUDGET_MS: u64 = 500;
+
+#[tokio::test]
+async fn test_spinning_guest_does_not_block_its_neighbour() {
+    let make_script = || Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let spin_limits = RuntimeLimits {
+        max_cpu_time_ms: 0,
+        max_wall_clock_time_ms: SPIN_BUDGET_MS,
+        ..Default::default()
+    };
+
+    let mut spinner = WasmWorker::new(make_script(), Some(spin_limits), None)
+        .await
+        .expect("Failed to create worker");
+
+    let mut neighbour = WasmWorker::new(make_script(), None, None)
+        .await
+        .expect("Failed to create worker");
+
+    let start = std::time::Instant::now();
+
+    let spin = async {
+        let (event, _rx) = Event::fetch(get_request("https://example.com/spin"));
+        spinner.exec(event).await
+    };
+
+    let serve = async {
+        let (event, rx) = Event::fetch(get_request("https://example.com/hello"));
+        neighbour
+            .exec(event)
+            .await
+            .expect("Failed to execute event");
+        rx.await.expect("Failed to receive response");
+        start.elapsed()
+    };
+
+    let (spin_result, served_after) = tokio::join!(spin, serve);
+
+    assert_eq!(spin_result, Err(TerminationReason::WallClockTimeout));
+    assert!(
+        served_after < std::time::Duration::from_millis(SPIN_BUDGET_MS / 2),
+        "the spinning guest held the executor for {:?}",
+        served_after
+    );
+}
+
 #[tokio::test]
 async fn test_infinite_loop_hits_cpu_fuel_limit() {
     let script = Script {
