@@ -1,37 +1,12 @@
 //! WebAssembly runtime for OpenWorkers using Wasmtime
 //!
-//! This runtime executes WebAssembly modules compiled from Rust, Go, C++, etc.
-//! It provides the same Worker interface as the V8 runtime but for WASM workloads.
+//! Executes WebAssembly components (compiled from Rust, Go, C++, ...) behind
+//! the same `openworkers_core::Worker` interface as the JS runtimes.
 //!
-//! ## Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────┐
-//! │                    OpenWorkers Runner                    │
-//! ├─────────────────────────────────────────────────────────┤
-//! │  ┌─────────────────┐       ┌─────────────────────────┐  │
-//! │  │  runtime-v8     │       │   runtime-wasm          │  │
-//! │  │  (JavaScript)   │       │   (Rust/Go/C++ → WASM)  │  │
-//! │  └─────────────────┘       └─────────────────────────┘  │
-//! │           │                           │                  │
-//! │           └───────────┬───────────────┘                  │
-//! │                       ▼                                  │
-//! │              openworkers-core                            │
-//! │         (Worker trait, Task, HttpRequest, etc.)          │
-//! └─────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Guest Interface (what WASM modules export)
-//!
-//! WASM modules must export these functions:
-//! - `handle_fetch(request_ptr, request_len) -> response_ptr`
-//! - `handle_scheduled(time: i64) -> i32`
-//!
-//! And import these host functions:
-//! - `host_log(level, msg_ptr, msg_len)`
-//! - `host_fetch(request_ptr, request_len) -> response_ptr`
-//! - `host_kv_get(key_ptr, key_len) -> value_ptr`
-//! - etc.
+//! Guests target the `openworkers:worker` WIT world (see `wit/worker.wit`):
+//! they export the `handler` interface (`handle-fetch`, `handle-scheduled`)
+//! and can import the `host` interface (`log`, `get-env`, `fetch`). Host
+//! operations are delegated to the runner through `OperationsHandler`.
 
 mod worker;
 

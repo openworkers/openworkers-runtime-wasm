@@ -77,6 +77,47 @@ async fn test_hello_worker_fetch() {
 }
 
 #[tokio::test]
+async fn test_hello_worker_proxy_without_ops() {
+    let wasm_bytes = load_hello_worker_wasm();
+
+    let script = Script {
+        code: WorkerCode::WebAssembly(wasm_bytes),
+        env: None,
+        bindings: vec![],
+    };
+
+    let mut worker = WasmWorker::new(script, None, None)
+        .await
+        .expect("Failed to create worker");
+
+    let request = HttpRequest {
+        url: "https://example.com/proxy".to_string(),
+        method: HttpMethod::Get,
+        headers: HashMap::new(),
+        body: RequestBody::None,
+    };
+
+    let (event, rx) = Event::fetch(request);
+    worker.exec(event).await.expect("Failed to execute event");
+
+    let response = rx.await.expect("Failed to receive response");
+
+    // Without an operations handle, host.fetch fails and the guest reports it
+    assert_eq!(response.status, 502);
+
+    if let openworkers_core::ResponseBody::Bytes(body) = &response.body {
+        let body_str = String::from_utf8_lossy(body);
+        assert!(
+            body_str.contains("no operations handle"),
+            "Body should surface the host fetch error, got: {}",
+            body_str
+        );
+    } else {
+        panic!("Expected Bytes response body");
+    }
+}
+
+#[tokio::test]
 async fn test_hello_worker_scheduled() {
     let wasm_bytes = load_hello_worker_wasm();
 

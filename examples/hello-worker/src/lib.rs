@@ -12,7 +12,7 @@ wit_bindgen::generate!({
 // Import the generated types
 use exports::openworkers::worker::handler::Guest;
 use openworkers::worker::host;
-use openworkers::worker::types::{HttpRequest, HttpResponse};
+use openworkers::worker::types::{HttpMethod, HttpRequest, HttpResponse};
 
 struct HelloWorker;
 
@@ -23,6 +23,10 @@ impl Guest for HelloWorker {
             1,
             &format!("Received {:?} request to {}", request.method, request.url),
         );
+
+        if request.url.contains("/proxy") {
+            return proxy_upstream();
+        }
 
         // Get greeting from env or use default
         let greeting = host::get_env("GREETING").unwrap_or_else(|| "Hello".to_string());
@@ -35,7 +39,7 @@ impl Guest for HelloWorker {
 
         // Build response body
         let body = format!(
-            "{} from Rust WASM! 🦀\nYou requested: {}",
+            "{} from Rust WASM!\nYou requested: {}",
             greeting, request.url
         );
 
@@ -51,6 +55,31 @@ impl Guest for HelloWorker {
             1,
             &format!("Scheduled event at timestamp: {}", scheduled_time),
         );
+    }
+}
+
+/// Fetch a fixed upstream URL through host.fetch and relay the result
+fn proxy_upstream() -> HttpResponse {
+    let upstream = HttpRequest {
+        method: HttpMethod::Get,
+        url: "https://upstream.example/data".to_string(),
+        headers: vec![],
+        body: None,
+    };
+
+    let headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
+
+    match host::fetch(&upstream) {
+        Ok(response) => HttpResponse {
+            status: response.status,
+            headers,
+            body: response.body,
+        },
+        Err(e) => HttpResponse {
+            status: 502,
+            headers,
+            body: Some(format!("upstream fetch failed: {}", e).into_bytes()),
+        },
     }
 }
 
