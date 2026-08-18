@@ -50,7 +50,7 @@ const EPOCH_TICK: Duration = Duration::from_millis(10);
 const FUEL_UNITS_PER_MS: u64 = 10_000;
 
 /// State held by each WASM instance
-pub struct WasmState {
+struct WasmState {
     /// WASI context
     wasi: WasiCtx,
     /// wasi:http context
