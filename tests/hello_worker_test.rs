@@ -1,11 +1,13 @@
 //! Integration test for hello-worker WASM module
 
 use openworkers_core::{
-    Event, HttpMethod, HttpRequest, RequestBody, RuntimeLimits, Script, TerminationReason,
-    WorkerCode,
+    Event, HttpMethod, HttpRequest, HttpResponse, LogLevel, OpFuture, OperationsHandler,
+    RequestBody, ResponseBody, RuntimeLimits, Script, TerminationReason, WorkerCode,
 };
 use openworkers_runtime_wasm::WasmWorker;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 fn get_request(url: &str) -> HttpRequest {
     HttpRequest {
@@ -66,14 +68,14 @@ async fn test_hello_worker_fetch() {
     println!("Status: {}", response.status);
     println!("Headers: {:?}", response.headers);
 
-    if let openworkers_core::ResponseBody::Bytes(body) = &response.body {
+    if let ResponseBody::Bytes(body) = &response.body {
         println!("Body: {}", String::from_utf8_lossy(body));
     }
 
     assert_eq!(response.status, 200);
 
     // Check body contains our greeting
-    if let openworkers_core::ResponseBody::Bytes(body) = &response.body {
+    if let ResponseBody::Bytes(body) = &response.body {
         let body_str = String::from_utf8_lossy(body);
         assert!(
             body_str.contains("Bonjour"),
@@ -117,7 +119,7 @@ async fn test_hello_worker_proxy_without_ops() {
     // Without an operations handle, host.fetch fails and the guest reports it
     assert_eq!(response.status, 502);
 
-    if let openworkers_core::ResponseBody::Bytes(body) = &response.body {
+    if let ResponseBody::Bytes(body) = &response.body {
         let body_str = String::from_utf8_lossy(body);
         assert!(
             body_str.contains("no operations handle"),
@@ -127,6 +129,72 @@ async fn test_hello_worker_proxy_without_ops() {
     } else {
         panic!("Expected Bytes response body");
     }
+}
+
+struct MockOps {
+    logs: Mutex<Vec<(LogLevel, String)>>,
+    fetched_urls: Mutex<Vec<String>>,
+}
+
+impl OperationsHandler for MockOps {
+    fn handle_fetch(&self, request: HttpRequest) -> OpFuture<'_, Result<HttpResponse, String>> {
+        self.fetched_urls.lock().unwrap().push(request.url);
+
+        Box::pin(async {
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: ResponseBody::Bytes(bytes::Bytes::from("mock upstream body")),
+            })
+        })
+    }
+
+    fn handle_log(&self, level: LogLevel, message: String) {
+        self.logs.lock().unwrap().push((level, message));
+    }
+}
+
+#[tokio::test]
+async fn test_log_and_fetch_flow_through_ops() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let ops = Arc::new(MockOps {
+        logs: Mutex::new(vec![]),
+        fetched_urls: Mutex::new(vec![]),
+    });
+
+    let mut worker = WasmWorker::new_with_ops(script, None, ops.clone())
+        .await
+        .expect("Failed to create worker");
+
+    let (event, rx) = Event::fetch(get_request("https://example.com/proxy"));
+    worker.exec(event).await.expect("Failed to execute event");
+
+    let response = rx.await.expect("Failed to receive response");
+
+    assert_eq!(response.status, 200);
+
+    if let ResponseBody::Bytes(body) = &response.body {
+        assert_eq!(&body[..], b"mock upstream body");
+    } else {
+        panic!("Expected Bytes response body");
+    }
+
+    let fetched = ops.fetched_urls.lock().unwrap();
+    assert_eq!(fetched.as_slice(), ["https://upstream.example/data"]);
+
+    let logs = ops.logs.lock().unwrap();
+    assert!(
+        logs.iter().any(|(level, message)| {
+            *level == LogLevel::Info && message.contains("example.com/proxy")
+        }),
+        "Guest request log should reach the ops handler, got: {:?}",
+        logs
+    );
 }
 
 #[tokio::test]

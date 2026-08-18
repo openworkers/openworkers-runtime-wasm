@@ -3,8 +3,8 @@
 //! Uses WIT (WebAssembly Interface Types) for type-safe host/guest communication.
 
 use openworkers_core::{
-    Event, HttpMethod, HttpRequest, HttpResponse, OperationsHandle, RequestBody, ResponseBody,
-    RuntimeLimits, Script, TaskResult, TaskSource, TerminationReason, WorkerCode,
+    Event, HttpMethod, HttpRequest, HttpResponse, LogLevel, OperationsHandle, RequestBody,
+    ResponseBody, RuntimeLimits, Script, TaskResult, TaskSource, TerminationReason, WorkerCode,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -129,14 +129,18 @@ impl WasiView for WasmState {
 // Implement the host interface for WasmState
 impl openworkers::worker::host::Host for WasmState {
     async fn log(&mut self, level: u8, message: String) {
-        let level_str = match level {
-            0 => "DEBUG",
-            1 => "INFO",
-            2 => "WARN",
-            3 => "ERROR",
-            _ => "LOG",
+        let level = match level {
+            0 => LogLevel::Debug,
+            1 => LogLevel::Info,
+            2 => LogLevel::Warn,
+            3 => LogLevel::Error,
+            _ => LogLevel::Log,
         };
-        println!("[WASM {}] {}", level_str, message);
+
+        match &self.ops {
+            Some(ops) => ops.handle_log(level, message),
+            None => println!("[WASM {}] {}", level, message),
+        }
     }
 
     async fn get_env(&mut self, key: String) -> Option<String> {
