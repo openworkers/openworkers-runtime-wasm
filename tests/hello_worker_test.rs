@@ -117,6 +117,55 @@ async fn test_hello_worker_proxy_without_ops() {
     }
 }
 
+/// Reports per-request exec latency; run with --nocapture to see the numbers
+#[tokio::test]
+async fn test_exec_latency_report() {
+    let wasm_bytes = load_hello_worker_wasm();
+
+    let script = Script {
+        code: WorkerCode::WebAssembly(wasm_bytes),
+        env: None,
+        bindings: vec![],
+    };
+
+    let mut worker = WasmWorker::new(script, None, None)
+        .await
+        .expect("Failed to create worker");
+
+    let make_request = || HttpRequest {
+        url: "https://example.com/bench".to_string(),
+        method: HttpMethod::Get,
+        headers: HashMap::new(),
+        body: RequestBody::None,
+    };
+
+    // Warmup
+    for _ in 0..20 {
+        let (event, rx) = Event::fetch(make_request());
+        worker.exec(event).await.expect("Failed to execute event");
+        rx.await.expect("Failed to receive response");
+    }
+
+    const ITERATIONS: u32 = 200;
+
+    let start = std::time::Instant::now();
+
+    for _ in 0..ITERATIONS {
+        let (event, rx) = Event::fetch(make_request());
+        worker.exec(event).await.expect("Failed to execute event");
+        rx.await.expect("Failed to receive response");
+    }
+
+    let elapsed = start.elapsed();
+
+    println!(
+        "exec latency: {} iterations in {:?}, avg {:?}/request",
+        ITERATIONS,
+        elapsed,
+        elapsed / ITERATIONS
+    );
+}
+
 #[tokio::test]
 async fn test_hello_worker_scheduled() {
     let wasm_bytes = load_hello_worker_wasm();

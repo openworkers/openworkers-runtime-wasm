@@ -152,8 +152,9 @@ impl openworkers::worker::types::Host for WasmState {}
 pub struct WasmWorker {
     /// Wasmtime engine (can be shared across workers)
     engine: Engine,
-    /// Compiled component
-    component: Component,
+    /// Pre-instantiated component: compilation and import resolution are done
+    /// once here, so per-request instantiation only allocates the instance
+    instance_pre: WorkerPre<WasmState>,
     /// Runtime limits
     limits: RuntimeLimits,
     /// Abort flag
@@ -184,9 +185,7 @@ impl WasmWorker {
     ) -> Result<Self, TerminationReason> {
         let limits = limits.unwrap_or_default();
 
-        // Configure engine with async and component model support
         let mut config = Config::new();
-        config.async_support(true);
 
         // Enable fuel-based metering for CPU limiting
         if limits.max_cpu_time_ms > 0 {
@@ -217,9 +216,29 @@ impl WasmWorker {
             TerminationReason::InitializationError(format!("Failed to compile component: {}", e))
         })?;
 
+        let mut linker = Linker::new(&engine);
+
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| {
+            TerminationReason::InitializationError(format!("Failed to add WASI to linker: {}", e))
+        })?;
+
+        Worker::add_to_linker::<_, HasSelf<WasmState>>(&mut linker, |state| state).map_err(
+            |e| TerminationReason::InitializationError(format!("Failed to add to linker: {}", e)),
+        )?;
+
+        let instance_pre = linker
+            .instantiate_pre(&component)
+            .and_then(WorkerPre::new)
+            .map_err(|e| {
+                TerminationReason::InitializationError(format!(
+                    "Failed to pre-instantiate component: {}",
+                    e
+                ))
+            })?;
+
         Ok(Self {
             engine,
-            component,
+            instance_pre,
             limits,
             aborted: Arc::new(AtomicBool::new(false)),
             env: script.env.unwrap_or_default(),
@@ -274,28 +293,7 @@ impl WasmWorker {
         &mut self,
         request: &HttpRequest,
     ) -> Result<HttpResponse, TerminationReason> {
-        // Create store with state
-        let mut store = self.create_store()?;
-
-        // Create linker and add host functions
-        let mut linker = Linker::new(&self.engine);
-
-        // Add WASI to the linker
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| {
-            TerminationReason::InitializationError(format!("Failed to add WASI to linker: {}", e))
-        })?;
-
-        // Add our custom host functions
-        Worker::add_to_linker::<_, HasSelf<WasmState>>(&mut linker, |state| state).map_err(
-            |e| TerminationReason::InitializationError(format!("Failed to add to linker: {}", e)),
-        )?;
-
-        // Instantiate the component
-        let worker = Worker::instantiate_async(&mut store, &self.component, &linker)
-            .await
-            .map_err(|e| {
-                TerminationReason::Exception(format!("Failed to instantiate component: {}", e))
-            })?;
+        let (mut store, worker) = self.instantiate().await?;
 
         // Convert HttpRequest to WIT types
         let wit_request = self.to_wit_request(request)?;
@@ -313,23 +311,7 @@ impl WasmWorker {
 
     /// Handle a scheduled event
     async fn handle_scheduled(&mut self, time: u64) -> Result<(), TerminationReason> {
-        let mut store = self.create_store()?;
-
-        let mut linker = Linker::new(&self.engine);
-
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| {
-            TerminationReason::InitializationError(format!("Failed to add WASI to linker: {}", e))
-        })?;
-
-        Worker::add_to_linker::<_, HasSelf<WasmState>>(&mut linker, |state| state).map_err(
-            |e| TerminationReason::InitializationError(format!("Failed to add to linker: {}", e)),
-        )?;
-
-        let worker = Worker::instantiate_async(&mut store, &self.component, &linker)
-            .await
-            .map_err(|e| {
-                TerminationReason::Exception(format!("Failed to instantiate component: {}", e))
-            })?;
+        let (mut store, worker) = self.instantiate().await?;
 
         worker
             .openworkers_worker_handler()
@@ -340,19 +322,27 @@ impl WasmWorker {
         Ok(())
     }
 
-    /// Create a new store with state
-    fn create_store(&self) -> Result<Store<WasmState>, TerminationReason> {
+    /// Create a fresh store and instantiate the pre-linked component in it
+    async fn instantiate(&self) -> Result<(Store<WasmState>, Worker), TerminationReason> {
         let state = WasmState::new(self.env.clone(), self.aborted.clone(), self.ops.clone());
         let mut store = Store::new(&self.engine, state);
 
         // Set fuel for CPU limiting (if enabled)
         if self.limits.max_cpu_time_ms > 0 {
-            // Approximate: 1ms ≈ 10000 fuel units (rough estimate)
+            // Approximate: 1ms is about 10000 fuel units (rough estimate)
             let fuel = self.limits.max_cpu_time_ms * 10000;
             store.set_fuel(fuel).ok();
         }
 
-        Ok(store)
+        let worker = self
+            .instance_pre
+            .instantiate_async(&mut store)
+            .await
+            .map_err(|e| {
+                TerminationReason::Exception(format!("Failed to instantiate component: {}", e))
+            })?;
+
+        Ok((store, worker))
     }
 
     /// Convert HttpRequest to WIT HttpRequest
