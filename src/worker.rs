@@ -52,21 +52,14 @@ const FUEL_UNITS_PER_MS: u64 = 10_000;
 /// Length at which an unterminated guest log line is emitted anyway
 const MAX_LOG_LINE: usize = 8 * 1024;
 
-/// State held by each WASM instance
 struct WasmState {
-    /// WASI context
     wasi: WasiCtx,
-    /// wasi:http context
     http: WasiHttpCtx,
-    /// Resource table (required by wasmtime component model)
     table: ResourceTable,
-    /// Abort flag
     aborted: Arc<AtomicBool>,
-    /// Wall-clock deadline for this execution (None = no limit)
+    /// Wall-clock deadline for this execution; None means no limit
     deadline: Option<Instant>,
-    /// Memory limiter enforcing heap_max_mb
     limiter: MemoryLimiter,
-    /// Outbound request routing (through the runner's ops handler)
     hooks: OpsHooks,
 }
 
@@ -78,7 +71,6 @@ impl WasmState {
         deadline: Option<Instant>,
         max_memory_bytes: usize,
     ) -> Self {
-        // Build WASI context with environment variables
         let mut wasi_builder = WasiCtxBuilder::new();
 
         for (k, v) in env {
@@ -197,8 +189,7 @@ impl WasiHttpHooks for OpsHooks {
     }
 }
 
-/// Buffer the outgoing request, run it through ops.handle_fetch, and buffer
-/// the response back into a wasi:http incoming response
+/// Request and response are buffered whole; the ops handler has no streaming form
 async fn ops_send_request(
     ops: OperationsHandle,
     request: hyper::Request<HyperOutgoingBody>,
@@ -346,26 +337,18 @@ impl Drop for OpsLogWriter {
 
 /// WebAssembly Worker using Wasmtime Component Model
 pub struct WasmWorker {
-    /// Wasmtime engine (can be shared across workers)
     engine: Engine,
-    /// Pre-instantiated wasi:http/incoming-handler (None if not exported)
+    /// None when the guest does not export wasi:http/incoming-handler
     proxy_pre: Option<ProxyPre<WasmState>>,
-    /// Pre-instantiated scheduled handler (None if not exported)
+    /// None when the guest does not export openworkers:worker/scheduled
     scheduled_pre: Option<ScheduledOnlyPre<WasmState>>,
-    /// Runtime limits
     limits: RuntimeLimits,
-    /// Abort flag
     aborted: Arc<AtomicBool>,
-    /// Environment variables from script
     env: HashMap<String, String>,
-    /// Operations handle for fetch, log, etc. (delegated to runner)
     ops: Option<OperationsHandle>,
 }
 
 impl WasmWorker {
-    /// Create a new WASM worker with an OperationsHandler
-    ///
-    /// All operations (fetch, log, etc.) go through the runner's OperationsHandler.
     pub async fn new_with_ops(
         script: Script,
         limits: Option<RuntimeLimits>,
@@ -374,7 +357,6 @@ impl WasmWorker {
         WasmWorker::new(script, limits, Some(ops)).await
     }
 
-    /// Create a new WASM worker from a Component
     pub async fn new(
         script: Script,
         limits: Option<RuntimeLimits>,
@@ -387,7 +369,6 @@ impl WasmWorker {
         // Epoch interruption drives wall-clock limits and abort()
         config.epoch_interruption(true);
 
-        // Enable fuel-based metering for CPU limiting
         if limits.max_cpu_time_ms > 0 {
             config.consume_fuel(true);
         }
@@ -411,7 +392,6 @@ impl WasmWorker {
             }
         });
 
-        // Extract WASM bytes from WorkerCode
         let wasm_bytes = match &script.code {
             WorkerCode::WebAssembly(bytes) => bytes,
             WorkerCode::JavaScript(_) => {
@@ -426,7 +406,6 @@ impl WasmWorker {
             }
         };
 
-        // Compile the component
         let component = Component::new(&engine, wasm_bytes).map_err(|e| {
             TerminationReason::InitializationError(format!("Failed to compile component: {}", e))
         })?;
@@ -451,22 +430,22 @@ impl WasmWorker {
             ))
         })?;
 
-        // A guest may export the HTTP handler, the scheduled handler, or both
-        let proxy_pre = ProxyPre::new(instance_pre.clone()).ok();
-        let scheduled_pre = ScheduledOnlyPre::new(instance_pre).ok();
+        // A guest may export the HTTP handler, the scheduled handler, or both;
+        // a guest that binds neither needs both errors to be diagnosable
+        let proxy_pre = ProxyPre::new(instance_pre.clone());
+        let scheduled_pre = ScheduledOnlyPre::new(instance_pre);
 
-        if proxy_pre.is_none() && scheduled_pre.is_none() {
-            return Err(TerminationReason::InitializationError(
-                "component exports neither wasi:http/incoming-handler nor \
-                 openworkers:worker/scheduled"
-                    .to_string(),
-            ));
+        if let (Err(http), Err(scheduled)) = (&proxy_pre, &scheduled_pre) {
+            return Err(TerminationReason::InitializationError(format!(
+                "component binds neither wasi:http/incoming-handler ({http}) nor \
+                 openworkers:worker/scheduled ({scheduled})"
+            )));
         }
 
         Ok(Self {
             engine,
-            proxy_pre,
-            scheduled_pre,
+            proxy_pre: proxy_pre.ok(),
+            scheduled_pre: scheduled_pre.ok(),
             limits,
             aborted: Arc::new(AtomicBool::new(false)),
             env: script.env.unwrap_or_default(),
@@ -474,7 +453,6 @@ impl WasmWorker {
         })
     }
 
-    /// Execute an event
     pub async fn exec(&mut self, event: Event) -> Result<(), TerminationReason> {
         if self.aborted.load(Ordering::SeqCst) {
             return Err(TerminationReason::Aborted);
@@ -516,7 +494,6 @@ impl WasmWorker {
         }
     }
 
-    /// Handle a fetch event through wasi:http/incoming-handler
     async fn handle_fetch(
         &mut self,
         request: HttpRequest,
@@ -636,7 +613,6 @@ impl WasmWorker {
         }
     }
 
-    /// Handle a scheduled event
     async fn handle_scheduled(&mut self, time: u64) -> Result<(), TerminationReason> {
         let Some(scheduled_pre) = &self.scheduled_pre else {
             return Err(TerminationReason::Other(
@@ -684,7 +660,6 @@ impl WasmWorker {
                 .ok();
         }
 
-        // Re-check the wall-clock deadline and abort flag on every epoch tick
         store.set_epoch_deadline(1);
         store.epoch_deadline_callback(|cx| {
             let state = cx.data();
@@ -703,7 +678,6 @@ impl WasmWorker {
         store
     }
 
-    /// Map a failed guest call to a TerminationReason using the store state
     fn termination_reason(
         store: &Store<WasmState>,
         context: &str,
@@ -732,8 +706,6 @@ impl WasmWorker {
         TerminationReason::Exception(format!("{} failed: {}", context, e))
     }
 
-    /// Abort the worker
-    ///
     /// Interrupts running guest code at the next epoch check; the epoch bump
     /// makes that immediate instead of waiting for the next ticker interval.
     pub fn abort(&mut self) {
@@ -742,7 +714,6 @@ impl WasmWorker {
     }
 }
 
-// Implement the Worker trait
 impl openworkers_core::Worker for WasmWorker {
     async fn new(script: Script, limits: Option<RuntimeLimits>) -> Result<Self, TerminationReason> {
         WasmWorker::new(script, limits, None).await

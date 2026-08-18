@@ -42,7 +42,6 @@ fn load_hello_worker_wasm() -> Vec<u8> {
 async fn test_hello_worker_fetch() {
     let wasm_bytes = load_hello_worker_wasm();
 
-    // Create script with WASM bytes
     let script = Script {
         code: WorkerCode::WebAssembly(wasm_bytes),
         env: Some(HashMap::from([(
@@ -52,12 +51,10 @@ async fn test_hello_worker_fetch() {
         bindings: vec![],
     };
 
-    // Create worker (no ops handle, so fetch won't work)
     let mut worker = WasmWorker::new(script, None, None)
         .await
         .expect("Failed to create worker");
 
-    // Create request
     let request = HttpRequest {
         url: "https://example.com/test".to_string(),
         method: HttpMethod::Get,
@@ -65,11 +62,9 @@ async fn test_hello_worker_fetch() {
         body: RequestBody::None,
     };
 
-    // Execute event
     let (event, rx) = Event::fetch(request);
     worker.exec(event).await.expect("Failed to execute event");
 
-    // Get response
     let response = rx.await.expect("Failed to receive response");
 
     println!("Status: {}", response.status);
@@ -81,7 +76,6 @@ async fn test_hello_worker_fetch() {
 
     assert_eq!(response.status, 200);
 
-    // Check body contains our greeting
     if let ResponseBody::Bytes(body) = &response.body {
         let body_str = String::from_utf8_lossy(body);
         assert!(
@@ -463,11 +457,9 @@ async fn test_hello_worker_scheduled() {
         .await
         .expect("Failed to create worker");
 
-    // Execute scheduled task
     let (event, rx) = Event::from_schedule("test-task".to_string(), 1234567890);
     worker.exec(event).await.expect("Failed to execute event");
 
-    // Should complete successfully
     let result = rx.await.expect("Scheduled task should complete");
     assert!(result.success, "Task result should be successful");
 }
