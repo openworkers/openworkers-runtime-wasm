@@ -403,7 +403,7 @@ impl WasmWorker {
 
         // Extract WASM bytes from WorkerCode
         let wasm_bytes = match &script.code {
-            WorkerCode::WebAssembly(bytes) => bytes.clone(),
+            WorkerCode::WebAssembly(bytes) => bytes,
             WorkerCode::JavaScript(_) => {
                 return Err(TerminationReason::InitializationError(
                     "WASM runtime cannot execute JavaScript code".to_string(),
@@ -417,7 +417,7 @@ impl WasmWorker {
         };
 
         // Compile the component
-        let component = Component::new(&engine, &wasm_bytes).map_err(|e| {
+        let component = Component::new(&engine, wasm_bytes).map_err(|e| {
             TerminationReason::InitializationError(format!("Failed to compile component: {}", e))
         })?;
 
