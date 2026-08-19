@@ -11,12 +11,13 @@ license = "Apache-2.0"
 # openworkers-core = { path = "../openworkers-core", features = ["wasm"] }
 openworkers-core = { git = "https://github.com/openworkers/openworkers-core", tag = "v0.14.0", features = ["wasm"] }
 
-# Wasmtime runtime with component model, WASI, and wasi:http support
-wasmtime = { version = "47", features = ["component-model"] }
+# Wasmtime runtime with component model, WASI, and wasi:http support;
+# component-model-async carries the WASI 0.3 async canonical ABI
+wasmtime = { version = "47", features = ["component-model", "component-model-async"] }
 wasmtime-wasi = "47"
 # default-send-request would pull in a TLS client stack; outbound requests go
 # through the runner's ops handler instead
-wasmtime-wasi-http = { version = "47", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "47", default-features = false, features = ["p2", "p3"] }
 
 # HTTP types shared with wasmtime-wasi-http
 hyper = "1"

@@ -1,0 +1,16 @@
+[package]
+name = "fetch-worker-v3"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.60", features = ["async-spawn"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

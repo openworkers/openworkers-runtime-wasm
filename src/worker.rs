@@ -35,6 +35,13 @@ use wasmtime_wasi_http::p2::body::{HyperIncomingBody, HyperOutgoingBody};
 use wasmtime_wasi_http::p2::types::{
     HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig,
 };
+use wasmtime_wasi_http::p3::Request as P3Request;
+use wasmtime_wasi_http::p3::RequestOptions as P3RequestOptions;
+use wasmtime_wasi_http::p3::WasiHttpCtxView as P3WasiHttpCtxView;
+use wasmtime_wasi_http::p3::WasiHttpHooks as P3WasiHttpHooks;
+use wasmtime_wasi_http::p3::WasiHttpView as P3WasiHttpView;
+use wasmtime_wasi_http::p3::bindings::ServicePre;
+use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode as P3ErrorCode;
 
 /// Interval of the background thread driving epoch interruption; also the
 /// granularity of wall-clock and abort checks
@@ -131,6 +138,18 @@ impl WasiHttpView for WasmState {
     }
 }
 
+// A store only ever runs one generation of guest, so both views can share
+// the same context and hooks
+impl P3WasiHttpView for WasmState {
+    fn http(&mut self) -> P3WasiHttpCtxView<'_> {
+        P3WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.hooks,
+        }
+    }
+}
+
 /// Per-store memory cap, none when the worker has no limit; records when the
 /// cap denied a growth so the failure can be reported as MemoryLimit instead
 /// of a generic trap
@@ -189,6 +208,102 @@ impl WasiHttpHooks for OpsHooks {
             }),
         ))
     }
+}
+
+/// Body type of the 0.3 host interfaces
+type P3Body = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, P3ErrorCode>;
+
+/// Completion future the 0.3 host interfaces pair with a body
+type P3Done = Box<dyn Future<Output = Result<(), P3ErrorCode>> + Send>;
+
+// The 0.3 face of the same bridge: wasi:http/client.send lands here
+impl P3WasiHttpHooks for OpsHooks {
+    fn send_request(
+        &mut self,
+        request: hyper::Request<P3Body>,
+        _options: Option<P3RequestOptions>,
+        _fut: P3Done,
+    ) -> Box<
+        dyn Future<
+                Output = Result<
+                    (hyper::Response<P3Body>, P3Done),
+                    wasmtime_wasi::TrappableError<P3ErrorCode>,
+                >,
+            > + Send,
+    > {
+        let ops = self.ops.clone();
+
+        Box::new(async move {
+            let Some(ops) = ops else {
+                return Err(P3ErrorCode::InternalError(Some(
+                    "fetch not available: no operations handle".to_string(),
+                ))
+                .into());
+            };
+
+            let response = ops_send_request_v3(ops, request).await?;
+
+            let done: P3Done = Box::new(std::future::ready(Ok(())));
+
+            Ok((response, done))
+        })
+    }
+}
+
+/// Request and response are buffered whole; the ops handler has no streaming form
+async fn ops_send_request_v3(
+    ops: OperationsHandle,
+    request: hyper::Request<P3Body>,
+) -> Result<hyper::Response<P3Body>, P3ErrorCode> {
+    let (parts, body) = request.into_parts();
+
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|e| P3ErrorCode::InternalError(Some(format!("request body failed: {}", e))))?
+        .to_bytes();
+
+    let method: HttpMethod = parts
+        .method
+        .as_str()
+        .parse()
+        .map_err(|_| P3ErrorCode::HttpRequestMethodInvalid)?;
+
+    let mut headers = HashMap::new();
+
+    for (name, value) in &parts.headers {
+        if let Ok(value) = value.to_str() {
+            headers.insert(name.to_string(), value.to_string());
+        }
+    }
+
+    let core_request = HttpRequest {
+        method,
+        url: parts.uri.to_string(),
+        headers,
+        body: if body_bytes.is_empty() {
+            RequestBody::None
+        } else {
+            RequestBody::Bytes(body_bytes)
+        },
+    };
+
+    let response = ops
+        .handle_fetch(core_request)
+        .await
+        .map_err(|e| P3ErrorCode::InternalError(Some(format!("fetch failed: {}", e))))?;
+
+    let mut builder = hyper::Response::builder().status(response.status);
+
+    for (name, value) in response.headers {
+        builder = builder.header(name, value);
+    }
+
+    let body_bytes = response.body.collect().await.unwrap_or_default();
+
+    builder
+        .body(full_body_v3(body_bytes))
+        .map_err(|e| P3ErrorCode::InternalError(Some(format!("invalid response: {}", e))))
 }
 
 /// Request and response are buffered whole; the ops handler has no streaming form
@@ -256,6 +371,11 @@ async fn ops_send_request(
 
 /// A buffered hyper body with the error type wasi:http expects
 fn full_body(bytes: bytes::Bytes) -> HyperIncomingBody {
+    Full::new(bytes).map_err(|e| match e {}).boxed_unsync()
+}
+
+/// The same buffered body against the 0.3 error type
+fn full_body_v3(bytes: bytes::Bytes) -> P3Body {
     Full::new(bytes).map_err(|e| match e {}).boxed_unsync()
 }
 
@@ -342,6 +462,8 @@ pub struct WasmWorker {
     engine: Engine,
     /// None when the guest does not export wasi:http/incoming-handler
     proxy_pre: Option<ProxyPre<WasmState>>,
+    /// None when the guest does not export the 0.3 wasi:http/handler
+    service_pre: Option<ServicePre<WasmState>>,
     /// None when the guest does not export openworkers:worker/scheduled
     scheduled_pre: Option<WorkerHostPre<WasmState>>,
     limits: RuntimeLimits,
@@ -370,6 +492,9 @@ impl WasmWorker {
 
         // Epoch interruption drives wall-clock limits and abort()
         config.epoch_interruption(true);
+
+        // The 0.3 async canonical ABI; inert for 0.2 guests
+        config.wasm_component_model_async(true);
 
         if limits.max_cpu_time_ms > 0 {
             config.consume_fuel(true);
@@ -425,6 +550,13 @@ impl WasmWorker {
             ))
         })?;
 
+        wasmtime_wasi_http::p3::add_to_linker(&mut linker).map_err(|e| {
+            TerminationReason::InitializationError(format!(
+                "Failed to add wasi:http 0.3 to linker: {}",
+                e
+            ))
+        })?;
+
         // Linked for every guest; one that imports no binding simply never
         // calls them
         WorkerHost::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state).map_err(|e| {
@@ -441,14 +573,17 @@ impl WasmWorker {
             ))
         })?;
 
-        // A guest may export the HTTP handler, the scheduled handler, or both;
-        // a guest that binds neither needs both errors to be diagnosable
+        // A guest may export either generation of the HTTP handler, the
+        // scheduled handler, or a combination; a guest that binds none of
+        // them needs every error to be diagnosable
         let proxy_pre = ProxyPre::new(instance_pre.clone());
+        let service_pre = ServicePre::new(instance_pre.clone());
         let scheduled_pre = WorkerHostPre::new(instance_pre);
 
-        if let (Err(http), Err(scheduled)) = (&proxy_pre, &scheduled_pre) {
+        if let (Err(http), Err(v3), Err(scheduled)) = (&proxy_pre, &service_pre, &scheduled_pre) {
             return Err(TerminationReason::InitializationError(format!(
-                "component binds neither wasi:http/incoming-handler ({http}) nor \
+                "component binds neither wasi:http/incoming-handler ({http}), \
+                 wasi:http/handler@0.3.0 ({v3}), nor \
                  openworkers:worker/scheduled ({scheduled})"
             )));
         }
@@ -456,6 +591,7 @@ impl WasmWorker {
         Ok(Self {
             engine,
             proxy_pre: proxy_pre.ok(),
+            service_pre: service_pre.ok(),
             scheduled_pre: scheduled_pre.ok(),
             limits,
             aborted: Arc::new(AtomicBool::new(false)),
@@ -509,6 +645,10 @@ impl WasmWorker {
         &mut self,
         request: HttpRequest,
     ) -> Result<HttpResponse, TerminationReason> {
+        if self.service_pre.is_some() {
+            return self.handle_fetch_v3(request).await;
+        }
+
         let Some(proxy_pre) = &self.proxy_pre else {
             return Err(TerminationReason::Other(
                 "guest does not export wasi:http/incoming-handler".to_string(),
@@ -547,7 +687,7 @@ impl WasmWorker {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         let (guest_request, guest_response_out) = {
-            let mut http = store.data_mut().http();
+            let mut http = WasiHttpView::http(store.data_mut());
 
             let guest_request = http
                 .new_incoming_request(scheme, hyper_request)
@@ -621,6 +761,104 @@ impl WasmWorker {
                     "guest returned without producing a response".to_string(),
                 )),
             },
+        }
+    }
+
+    /// Serves one request through the 0.3 `wasi:http/handler` export.
+    ///
+    /// Everything stays inside `run_concurrent`, because only its event loop
+    /// drives guest tasks. A guest defers post-response work by holding its
+    /// trailers future open, so collecting the body is also what runs that
+    /// work to completion.
+    async fn handle_fetch_v3(
+        &mut self,
+        request: HttpRequest,
+    ) -> Result<HttpResponse, TerminationReason> {
+        let Some(service_pre) = &self.service_pre else {
+            return Err(TerminationReason::Other(
+                "guest does not export wasi:http/handler@0.3.0".to_string(),
+            ));
+        };
+
+        let mut store = self.create_store();
+
+        let service = match service_pre.instantiate_async(&mut store).await {
+            Ok(service) => service,
+            Err(e) => return Err(Self::termination_reason(&store, "instantiate", e)),
+        };
+
+        let mut builder = hyper::Request::builder()
+            .method(request.method.as_str())
+            .uri(&request.url);
+
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+
+        // Buffered at the core boundary; the guest still sees a stream
+        let body_bytes = request.body.collect().await.unwrap_or_default();
+
+        let hyper_request = builder.body(full_body_v3(body_bytes)).map_err(|e| {
+            TerminationReason::Other(format!("could not build guest request: {}", e))
+        })?;
+
+        let (guest_request, _request_io) = P3Request::from_http(hyper_request);
+
+        // The epoch deadline only fires while guest code runs, so a guest
+        // idling on a handle nothing will complete needs a host-side timeout
+        let deadline = store.data().deadline;
+
+        let run = store.run_concurrent(async |accessor| -> wasmtime::Result<_> {
+            let response = match service.handle(accessor, guest_request).await? {
+                Ok(response) => response,
+                Err(code) => return Ok(Err(code)),
+            };
+
+            let response = accessor
+                .with(|mut access| response.into_http(&mut access, std::future::ready(Ok(()))))?;
+
+            let (parts, body) = response.into_parts();
+
+            let mut headers = Vec::new();
+
+            for (name, value) in &parts.headers {
+                if let Ok(value) = value.to_str() {
+                    headers.push((name.to_string(), value.to_string()));
+                }
+            }
+
+            let bytes = body
+                .collect()
+                .await
+                .map_err(|e| wasmtime::format_err!("response body failed: {e}"))?
+                .to_bytes();
+
+            Ok(Ok((parts.status.as_u16(), headers, bytes)))
+        });
+
+        let result = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline.into(), run).await {
+                Ok(result) => result,
+                Err(_) => return Err(TerminationReason::WallClockTimeout),
+            },
+            None => run.await,
+        };
+
+        match result {
+            Ok(Ok(Ok((status, headers, bytes)))) => Ok(HttpResponse {
+                status,
+                headers,
+                body: if bytes.is_empty() {
+                    ResponseBody::None
+                } else {
+                    ResponseBody::Bytes(bytes)
+                },
+            }),
+            Ok(Ok(Err(code))) => Err(TerminationReason::Exception(format!(
+                "guest rejected request: {}",
+                code
+            ))),
+            Ok(Err(e)) | Err(e) => Err(Self::termination_reason(&store, "handle", e)),
         }
     }
 
