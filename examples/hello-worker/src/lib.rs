@@ -30,6 +30,9 @@ use wasi::http::types::Scheme;
 /// wasi:io caps `blocking-write-and-flush` at this many bytes
 const CHUNK_SIZE: usize = 4096;
 
+/// List items the /render page carries
+const RENDERED_ITEMS: usize = 20_000;
+
 struct HelloWorker;
 
 impl HttpGuest for HelloWorker {
@@ -131,8 +134,8 @@ impl ScheduledGuest for HelloWorker {
 fn render_page() -> String {
     let mut page = String::from("<ul>");
 
-    for i in 0..20_000 {
-        page.push_str(&format!("<li>item {} of {}</li>", i, 20_000));
+    for i in 0..RENDERED_ITEMS {
+        page.push_str(&format!("<li>item {} of {}</li>", i, RENDERED_ITEMS));
     }
 
     page.push_str("</ul>");

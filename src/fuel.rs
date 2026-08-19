@@ -68,7 +68,7 @@ fn pinned_rate() -> Option<u64> {
 fn measure() -> Option<u64> {
     let mut config = Config::new();
 
-    // Match the guest configuration: both cost instructions per loop
+    // The guest engine has both, and each adds work to every loop
     config.epoch_interruption(true);
     config.consume_fuel(true);
 
