@@ -38,11 +38,16 @@ component built against the standard `wasi:http/proxy` world runs unmodified;
 
 ```wit
 world worker {
-    include wasi:http/proxy@0.2.12;
+    include wasi:http/proxy@0.2.0;
     include openworkers:bindings/imports@0.1.0;
     export scheduled;
 }
 ```
+
+wasi is declared at `0.2.0`, the floor of the 0.2 line, not at the host's patch
+level: every 0.2.x is semver-compatible and both wasm-tools and wasmtime resolve
+a 0.2.0 import or export against the newer implementation, so a toolchain that
+lags still builds against this contract.
 
 The host provides:
 

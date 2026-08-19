@@ -10,8 +10,13 @@ interface scheduled {
 /// platform bindings. Guests that only serve HTTP can target wasi:http/proxy
 /// directly and run unmodified; the scheduled export and the binding imports
 /// are then simply absent.
+///
+/// wasi is declared at 0.2.0, not at the host's patch level: the declared
+/// version is a floor, 0.2.x is semver-compatible, and both wasm-tools and
+/// wasmtime resolve these against the newer implementation the host links.
+/// Pinning higher only locks out toolchains that lag, TinyGo today.
 world worker {
-    include wasi:http/proxy@0.2.12;
+    include wasi:http/proxy@0.2.0;
     include openworkers:bindings/imports@0.1.0;
     export scheduled;
 }
