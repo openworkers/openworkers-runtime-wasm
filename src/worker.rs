@@ -61,7 +61,7 @@ impl WasmState {
         aborted: Arc<AtomicBool>,
         ops: Option<OperationsHandle>,
         deadline: Option<Instant>,
-        max_memory_bytes: usize,
+        max_memory_bytes: Option<usize>,
     ) -> Self {
         let mut wasi_builder = WasiCtxBuilder::new();
 
@@ -131,10 +131,11 @@ impl WasiHttpView for WasmState {
     }
 }
 
-/// Per-store memory cap; records when the cap denied a growth so the failure
-/// can be reported as MemoryLimit instead of a generic trap
+/// Per-store memory cap, none when the worker has no limit; records when the
+/// cap denied a growth so the failure can be reported as MemoryLimit instead
+/// of a generic trap
 struct MemoryLimiter {
-    max_memory_bytes: usize,
+    max_memory_bytes: Option<usize>,
     memory_limit_hit: bool,
 }
 
@@ -145,7 +146,7 @@ impl ResourceLimiter for MemoryLimiter {
         desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        if desired > self.max_memory_bytes {
+        if self.max_memory_bytes.is_some_and(|max| desired > max) {
             self.memory_limit_hit = true;
 
             return Ok(false);
@@ -652,12 +653,16 @@ impl WasmWorker {
         let deadline = (self.limits.max_wall_clock_time_ms > 0)
             .then(|| Instant::now() + Duration::from_millis(self.limits.max_wall_clock_time_ms));
 
+        // 0 disables the cap, as it does for the CPU and wall-clock budgets
+        let max_memory_bytes =
+            (self.limits.heap_max_mb > 0).then(|| self.limits.heap_max_mb * 1024 * 1024);
+
         let state = WasmState::new(
             &self.env,
             self.aborted.clone(),
             self.ops.clone(),
             deadline,
-            self.limits.heap_max_mb * 1024 * 1024,
+            max_memory_bytes,
         );
 
         let mut store = Store::new(&self.engine, state);

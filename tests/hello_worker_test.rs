@@ -387,6 +387,31 @@ async fn test_memory_hog_hits_memory_limit() {
     assert_eq!(result, Err(TerminationReason::MemoryLimit));
 }
 
+/// A heap_max_mb of 0 disables the cap, the way 0 disables the CPU and
+/// wall-clock budgets
+#[tokio::test]
+async fn test_zero_heap_max_disables_the_memory_limit() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let limits = RuntimeLimits {
+        heap_max_mb: 0,
+        ..Default::default()
+    };
+
+    let mut worker = WasmWorker::new(script, Some(limits), None)
+        .await
+        .expect("Failed to create worker");
+
+    let (event, rx) = Event::fetch(get_request("https://example.com/hello"));
+    worker.exec(event).await.expect("Failed to execute event");
+
+    assert_eq!(rx.await.expect("Failed to receive response").status, 200);
+}
+
 /// Reports per-request exec latency; run with --nocapture to see the numbers
 #[tokio::test]
 async fn test_exec_latency_report() {

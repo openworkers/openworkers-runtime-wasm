@@ -94,6 +94,10 @@ are JSON documents; `storage` bodies are opaque bytes.
 |---|---|
 | `max_cpu_time_ms` | fuel, 0 disables metering |
 | `max_wall_clock_time_ms` | epoch interruption, 0 disables the deadline |
+| `heap_max_mb` | a store memory limiter, 0 disables the cap |
+
+`heap_initial_mb` has no wasm counterpart: a component's memory starts at the
+size its module declares.
 
 Fuel is charged per wasm operation, so what a millisecond of CPU buys is a
 property of the machine: the runtime measures it once per process by burning a
