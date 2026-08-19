@@ -3,6 +3,7 @@
 //! HTTP guests implement the standard wasi:http/proxy world; the cron entry
 //! point comes from the custom `openworkers:worker/scheduled` interface.
 
+use crate::bindings::{WorkerHost, WorkerHostPre};
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use openworkers_core::{
@@ -17,7 +18,7 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
-use wasmtime::component::{Component, Linker, ResourceTable, bindgen};
+use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, Trap, UpdateDeadline};
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -34,14 +35,6 @@ use wasmtime_wasi_http::p2::types::{
     HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig,
 };
 
-// The wasi:http side is covered by wasmtime-wasi-http's own Proxy bindings
-bindgen!({
-    path: "wit",
-    world: "worker-host",
-    imports: { default: async },
-    exports: { default: async },
-});
-
 /// Interval of the background thread driving epoch interruption; also the
 /// granularity of wall-clock and abort checks
 const EPOCH_TICK: Duration = Duration::from_millis(10);
@@ -53,7 +46,7 @@ const FUEL_UNITS_PER_MS: u64 = 10_000;
 /// Length at which an unterminated guest log line is emitted anyway
 const MAX_LOG_LINE: usize = 8 * 1024;
 
-struct WasmState {
+pub(crate) struct WasmState {
     wasi: WasiCtx,
     http: WasiHttpCtx,
     table: ResourceTable,
@@ -62,6 +55,7 @@ struct WasmState {
     deadline: Option<Instant>,
     limiter: MemoryLimiter,
     hooks: OpsHooks,
+    ops: Option<OperationsHandle>,
 }
 
 impl WasmState {
@@ -107,8 +101,17 @@ impl WasmState {
                 max_memory_bytes,
                 memory_limit_hit: false,
             },
-            hooks: OpsHooks { ops },
+            hooks: OpsHooks { ops: ops.clone() },
+            ops,
         }
+    }
+
+    /// The runner serves every binding call, so without it there is nothing
+    /// to call
+    pub(crate) fn ops(&self) -> Result<OperationsHandle, String> {
+        self.ops
+            .clone()
+            .ok_or_else(|| "bindings not available: no operations handle".to_string())
     }
 }
 
@@ -420,6 +423,15 @@ impl WasmWorker {
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|e| {
             TerminationReason::InitializationError(format!(
                 "Failed to add wasi:http to linker: {}",
+                e
+            ))
+        })?;
+
+        // Linked for every guest; one that imports no binding simply never
+        // calls them
+        WorkerHost::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state).map_err(|e| {
+            TerminationReason::InitializationError(format!(
+                "Failed to add bindings to linker: {}",
                 e
             ))
         })?;

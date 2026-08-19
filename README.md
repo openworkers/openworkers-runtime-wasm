@@ -39,6 +39,7 @@ component built against the standard `wasi:http/proxy` world runs unmodified;
 ```wit
 world worker {
     include wasi:http/proxy@0.2.12;
+    include openworkers:bindings/imports@0.1.0;
     export scheduled;
 }
 ```
@@ -50,9 +51,27 @@ The host provides:
 - `wasi:cli/environment` - the worker's environment variables
 - `wasi:cli/stdout` and `wasi:cli/stderr` - guest output, forwarded to the
   runner's log handler line by line (stdout as info, stderr as error)
+- `openworkers:bindings/{database,kv,storage}` - the platform bindings, see
+  `wit/bindings.wit`
 
 Bodies are buffered at the boundary in both directions; streaming pass-through
 is not implemented yet.
+
+### Bindings
+
+Every binding call names its binding first, because a worker can hold several
+bindings of the same type:
+
+```rust
+use openworkers::bindings::database::{self, SqlParam, SqlValue};
+
+let params = [SqlParam::Value(SqlValue::Integer(42))];
+let row = database::first("DB", "SELECT * FROM items WHERE id = $1", &params)?;
+```
+
+`database` is shaped after D1: preparing a statement and binding its
+parameters happens guest-side, and rows come back as JSON text. `kv` values
+are JSON documents; `storage` bodies are opaque bytes.
 
 ## Writing a Worker (Rust)
 

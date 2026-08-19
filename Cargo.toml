@@ -28,5 +28,8 @@ tokio = { version = "1", features = ["sync", "time", "rt"] }
 # Bytes handling
 bytes = "1"
 
+# Rows and KV values cross the binding boundary as JSON
+serde_json = "1"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }
