@@ -37,12 +37,22 @@ component built against the standard `wasi:http/proxy` world runs unmodified;
 `wit/worker.wit` adds the cron entry point on top of it:
 
 ```wit
-world worker {
+world fetch-worker {
     include wasi:http/proxy@0.2.0;
     include openworkers:bindings/imports@0.1.0;
-    export scheduled;
+    import wasi:cli/environment@0.2.0;
+}
+
+world worker {
+    include fetch-worker;
+    include scheduled-only;
 }
 ```
+
+Target `fetch-worker` when the worker only serves HTTP and `worker` when it also
+handles cron; the two differ by the `scheduled` export alone, which is how the
+host tells them apart. `scheduled-only` carries that export on its own, for an
+SDK that adds it to `fetch-worker` only when the guest has a handler.
 
 wasi is declared at `0.2.0`, the floor of the 0.2 line, not at the host's patch
 level: every 0.2.x is semver-compatible and both wasm-tools and wasmtime resolve
@@ -143,12 +153,14 @@ worker.exec(task).await?;
 ## Examples
 
 - `examples/hello-worker` - HTTP plus cron, outbound fetch, environment
+- `examples/fetch-worker` - `world fetch-worker`: HTTP and the bindings, no cron
 - `examples/proxy-worker` - a stock `wasi:http/proxy` component, built from the
   upstream `wasi` crate with no OpenWorkers-specific WIT
 
 ```bash
 # Build the examples
 (cd examples/hello-worker && cargo build --target wasm32-wasip2 --release)
+(cd examples/fetch-worker && cargo build --target wasm32-wasip2 --release)
 (cd examples/proxy-worker && cargo build --target wasm32-wasip2 --release)
 
 # Run tests

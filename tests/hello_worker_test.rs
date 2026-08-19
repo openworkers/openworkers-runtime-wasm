@@ -462,6 +462,52 @@ async fn test_stock_proxy_component_has_no_scheduled_handler() {
     ));
 }
 
+/// A component targeting `world fetch-worker` serves HTTP with the platform
+/// bindings linked
+#[tokio::test]
+async fn test_fetch_worker_component_serves_http() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_component("fetch-worker")),
+        env: None,
+        bindings: vec![],
+    };
+
+    let ops = Arc::new(BindingOps::default());
+
+    let mut worker = WasmWorker::new_with_ops(script, None, ops)
+        .await
+        .expect("Failed to create worker");
+
+    let (event, rx) = Event::fetch(get_request("https://example.com/"));
+    worker.exec(event).await.expect("Failed to execute event");
+
+    let response = rx.await.expect("Failed to receive response");
+
+    assert_eq!(response.status, 200);
+    assert_eq!(body_text(&response), r#""hello""#);
+}
+
+/// `world fetch-worker` has no scheduled export, so cron events are refused
+#[tokio::test]
+async fn test_fetch_worker_component_has_no_scheduled_handler() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_component("fetch-worker")),
+        env: None,
+        bindings: vec![],
+    };
+
+    let mut worker = WasmWorker::new(script, None, None)
+        .await
+        .expect("Failed to create worker");
+
+    let (event, _rx) = Event::from_schedule("test-task".to_string(), 1234567890);
+
+    assert!(matches!(
+        worker.exec(event).await,
+        Err(TerminationReason::Other(_))
+    ));
+}
+
 #[tokio::test]
 async fn test_request_body_reaches_the_guest() {
     let script = Script {
