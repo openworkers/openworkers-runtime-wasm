@@ -88,6 +88,18 @@ let row = database::first("DB", "SELECT * FROM items WHERE id = $1", &params)?;
 parameters happens guest-side, and rows come back as JSON text. `kv` values
 are JSON documents; `storage` bodies are opaque bytes.
 
+## Limits
+
+| `RuntimeLimits` field | Mechanism |
+|---|---|
+| `max_cpu_time_ms` | fuel, 0 disables metering |
+| `max_wall_clock_time_ms` | epoch interruption, 0 disables the deadline |
+
+Fuel is charged per wasm operation, so what a millisecond of CPU buys is a
+property of the machine: the runtime measures it once per process by burning a
+known loop. `OW_WASM_FUEL_PER_MS` pins the rate instead, for a host that would
+rather not measure or wants every node to charge the same.
+
 ## Writing a Worker (Rust)
 
 ```rust

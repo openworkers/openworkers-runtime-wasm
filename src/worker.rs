@@ -4,6 +4,7 @@
 //! point comes from the custom `openworkers:worker/scheduled` interface.
 
 use crate::bindings::{WorkerHost, WorkerHostPre};
+use crate::fuel;
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use openworkers_core::{
@@ -38,10 +39,6 @@ use wasmtime_wasi_http::p2::types::{
 /// Interval of the background thread driving epoch interruption; also the
 /// granularity of wall-clock and abort checks
 const EPOCH_TICK: Duration = Duration::from_millis(10);
-
-/// Crude CPU metering: wasmtime charges roughly one fuel per instruction and
-/// this assumes 10k instructions per ms. Not calibrated against real hardware.
-const FUEL_UNITS_PER_MS: u64 = 10_000;
 
 /// Length at which an unterminated guest log line is emitted anyway
 const MAX_LOG_LINE: usize = 8 * 1024;
@@ -669,7 +666,7 @@ impl WasmWorker {
 
         if self.limits.max_cpu_time_ms > 0 {
             store
-                .set_fuel(self.limits.max_cpu_time_ms * FUEL_UNITS_PER_MS)
+                .set_fuel(self.limits.max_cpu_time_ms.saturating_mul(fuel::per_ms()))
                 .ok();
         }
 

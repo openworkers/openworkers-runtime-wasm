@@ -340,6 +340,29 @@ async fn test_infinite_loop_hits_cpu_fuel_limit() {
     assert_eq!(result, Err(TerminationReason::CpuTimeLimit));
 }
 
+/// The default 50 ms budget has to buy 50 ms of work: at the uncalibrated
+/// 10k fuel per ms it bought about 20 us and this page never finished
+#[tokio::test]
+async fn test_default_cpu_budget_renders_a_page() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let mut worker = WasmWorker::new(script, None, None)
+        .await
+        .expect("Failed to create worker");
+
+    let (event, rx) = Event::fetch(get_request("https://example.com/render"));
+    worker.exec(event).await.expect("Failed to execute event");
+
+    let response = rx.await.expect("Failed to receive response");
+
+    assert_eq!(response.status, 200);
+    assert!(body_text(&response).ends_with("<li>item 19999 of 20000</li></ul>"));
+}
+
 #[tokio::test]
 async fn test_memory_hog_hits_memory_limit() {
     let script = Script {

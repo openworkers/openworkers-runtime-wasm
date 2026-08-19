@@ -89,6 +89,11 @@ impl HttpGuest for HelloWorker {
             return;
         }
 
+        if path.starts_with("/render") {
+            respond(response_out, 200, render_page().into_bytes());
+            return;
+        }
+
         if path.starts_with("/spin") {
             loop {
                 std::hint::black_box(0);
@@ -119,6 +124,19 @@ impl ScheduledGuest for HelloWorker {
     fn handle_scheduled(scheduled_time: u64) {
         println!("Scheduled event at timestamp: {}", scheduled_time);
     }
+}
+
+/// A page of the size a real worker renders, so the CPU budget is measured
+/// against work rather than against a hello string
+fn render_page() -> String {
+    let mut page = String::from("<ul>");
+
+    for i in 0..20_000 {
+        page.push_str(&format!("<li>item {} of {}</li>", i, 20_000));
+    }
+
+    page.push_str("</ul>");
+    page
 }
 
 /// Binds one parameter of every sql-value shape, so the host mapping is

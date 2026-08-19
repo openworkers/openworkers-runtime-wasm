@@ -11,6 +11,7 @@
 //! (see `wit/bindings.wit`).
 
 mod bindings;
+mod fuel;
 mod worker;
 
 pub use worker::WasmWorker;
