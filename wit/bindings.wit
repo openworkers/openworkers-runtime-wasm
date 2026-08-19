@@ -92,9 +92,13 @@ package openworkers:bindings@0.1.0 {
         /// Remove an object; removing an absent object succeeds
         delete: func(binding: string, key: string) -> result<_, string>;
 
-        /// Read object metadata without its body. A missing object is an error
-        /// here, not none: the platform's head does not separate absence from
-        /// failure. Use `get` when the two have to be told apart.
+        /// Read object metadata without its body.
+        ///
+        /// A missing object is an `err` here, not an `ok(none)`, and this
+        /// asymmetry with `get` is the contract, not an oversight: the
+        /// platform reports absence as an error string, and telling it from a
+        /// real failure would mean matching on that message. A guest that has
+        /// to tell the two apart calls `get` and pays for the body.
         head: func(binding: string, key: string) -> result<object-info, string>;
 
         /// List keys under a prefix, up to the platform default when limit is
