@@ -37,7 +37,8 @@ use wasmtime_wasi_http::p2::types::{
 // The wasi:http side is covered by wasmtime-wasi-http's own Proxy bindings
 bindgen!({
     path: "wit",
-    world: "scheduled-only",
+    world: "worker-host",
+    imports: { default: async },
     exports: { default: async },
 });
 
@@ -341,7 +342,7 @@ pub struct WasmWorker {
     /// None when the guest does not export wasi:http/incoming-handler
     proxy_pre: Option<ProxyPre<WasmState>>,
     /// None when the guest does not export openworkers:worker/scheduled
-    scheduled_pre: Option<ScheduledOnlyPre<WasmState>>,
+    scheduled_pre: Option<WorkerHostPre<WasmState>>,
     limits: RuntimeLimits,
     aborted: Arc<AtomicBool>,
     env: HashMap<String, String>,
@@ -433,7 +434,7 @@ impl WasmWorker {
         // A guest may export the HTTP handler, the scheduled handler, or both;
         // a guest that binds neither needs both errors to be diagnosable
         let proxy_pre = ProxyPre::new(instance_pre.clone());
-        let scheduled_pre = ScheduledOnlyPre::new(instance_pre);
+        let scheduled_pre = WorkerHostPre::new(instance_pre);
 
         if let (Err(http), Err(scheduled)) = (&proxy_pre, &scheduled_pre) {
             return Err(TerminationReason::InitializationError(format!(

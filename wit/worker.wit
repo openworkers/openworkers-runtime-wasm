@@ -6,16 +6,20 @@ interface scheduled {
     handle-scheduled: func(scheduled-time: u64);
 }
 
-/// Full OpenWorkers guest: the standard wasi:http proxy plus cron.
-/// Guests that only serve HTTP can target wasi:http/proxy directly and
-/// run unmodified; the scheduled export is then simply absent.
+/// Full OpenWorkers guest: the standard wasi:http proxy, cron, and the
+/// platform bindings. Guests that only serve HTTP can target wasi:http/proxy
+/// directly and run unmodified; the scheduled export and the binding imports
+/// are then simply absent.
 world worker {
     include wasi:http/proxy@0.2.12;
+    include openworkers:bindings/imports@0.1.0;
     export scheduled;
 }
 
-/// Host-side view of the cron export alone; the HTTP side is bound
-/// through the wasi:http host implementation
-world scheduled-only {
+/// Host-side view of what this runtime adds to wasi:http/proxy: the bindings
+/// it links and the cron export it calls. The HTTP side is bound through the
+/// wasi:http host implementation.
+world worker-host {
+    include openworkers:bindings/imports@0.1.0;
     export scheduled;
 }
