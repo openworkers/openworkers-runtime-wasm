@@ -11,6 +11,11 @@ wit_bindgen::generate!({
 
 use exports::openworkers::worker::scheduled::Guest as ScheduledGuest;
 use exports::wasi::http::incoming_handler::Guest as HttpGuest;
+use openworkers::bindings::database;
+use openworkers::bindings::database::SqlParam;
+use openworkers::bindings::database::SqlValue;
+use openworkers::bindings::kv;
+use openworkers::bindings::storage;
 use wasi::http::outgoing_handler;
 use wasi::http::types::Fields;
 use wasi::http::types::IncomingBody;
@@ -43,6 +48,30 @@ impl HttpGuest for HelloWorker {
             let (status, body) = proxy_upstream();
 
             respond(response_out, status, body);
+            return;
+        }
+
+        if path.starts_with("/db") {
+            respond_probe(response_out, database_probe());
+            return;
+        }
+
+        if path.starts_with("/kv") {
+            respond_probe(response_out, kv_probe());
+            return;
+        }
+
+        if path.starts_with("/storage-meta") {
+            respond_probe(response_out, storage_meta_probe());
+            return;
+        }
+
+        if path.starts_with("/storage-bytes") {
+            match storage_bytes_probe() {
+                Ok(bytes) => respond(response_out, 200, bytes),
+                Err(e) => respond(response_out, 500, e.into_bytes()),
+            }
+
             return;
         }
 
@@ -89,6 +118,82 @@ impl HttpGuest for HelloWorker {
 impl ScheduledGuest for HelloWorker {
     fn handle_scheduled(scheduled_time: u64) {
         println!("Scheduled event at timestamp: {}", scheduled_time);
+    }
+}
+
+/// Binds one parameter of every sql-value shape, so the host mapping is
+/// exercised end to end
+fn database_probe() -> Result<String, String> {
+    let params = vec![
+        SqlParam::Value(SqlValue::Integer(42)),
+        SqlParam::Value(SqlValue::Float(1.5)),
+        SqlParam::Value(SqlValue::Text("widget".to_string())),
+        SqlParam::Value(SqlValue::Null),
+        SqlParam::Value(SqlValue::Boolean(true)),
+        SqlParam::Values(vec![SqlValue::Integer(1), SqlValue::Integer(2)]),
+    ];
+
+    let first = database::first("DB", "SELECT * FROM items WHERE id = $1", &params)?;
+    let all = database::all("DB", "SELECT * FROM items", &[])?;
+    let run = database::run("DB", "DELETE FROM items", &[])?;
+
+    Ok(format!(
+        "first={} all={} affected={} first-rows={}",
+        first.unwrap_or_else(|| "none".to_string()),
+        all.rows,
+        run.rows_affected,
+        all.meta.rows_affected
+    ))
+}
+
+fn kv_probe() -> Result<String, String> {
+    kv::put("CACHE", "greeting", "\"hello\"", Some(60))?;
+
+    let value = kv::get("CACHE", "greeting")?.unwrap_or_else(|| "none".to_string());
+    let keys = kv::list_keys("CACHE", Some("gre"), None)?;
+
+    kv::delete("CACHE", "greeting")?;
+
+    Ok(format!(
+        "value={} keys={} deleted={}",
+        value,
+        keys.join(","),
+        kv::get("CACHE", "greeting")?.is_none()
+    ))
+}
+
+/// Every byte value, so a body that survives is not being treated as text
+fn storage_body() -> Vec<u8> {
+    (0..=u8::MAX).collect()
+}
+
+fn storage_bytes_probe() -> Result<Vec<u8>, String> {
+    storage::put("BUCKET", "blob.bin", &storage_body())?;
+
+    storage::get("BUCKET", "blob.bin")?.ok_or_else(|| "blob.bin is missing".to_string())
+}
+
+fn storage_meta_probe() -> Result<String, String> {
+    storage::put("BUCKET", "meta.bin", &storage_body())?;
+
+    let info = storage::head("BUCKET", "meta.bin")?;
+    let listing = storage::list_keys("BUCKET", Some("meta"), None)?;
+
+    storage::delete("BUCKET", "meta.bin")?;
+
+    Ok(format!(
+        "size={} etag={} keys={} truncated={}",
+        info.size,
+        info.etag.unwrap_or_else(|| "none".to_string()),
+        listing.keys.join(","),
+        listing.truncated
+    ))
+}
+
+fn respond_probe(response_out: ResponseOutparam, probe: Result<String, String>) {
+    match probe {
+        Ok(body) => respond(response_out, 200, body.into_bytes()),
+        Err(e) => respond(response_out, 500, e.into_bytes()),
     }
 }
 

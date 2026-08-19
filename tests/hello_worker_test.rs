@@ -1,8 +1,9 @@
 //! Integration test for hello-worker WASM module
 
 use openworkers_core::{
-    Event, HttpMethod, HttpRequest, HttpResponse, LogLevel, OpFuture, OperationsHandler,
-    RequestBody, ResponseBody, RuntimeLimits, Script, TerminationReason, WorkerCode,
+    DatabaseOp, DatabaseResult, Event, HttpMethod, HttpRequest, HttpResponse, KvOp, KvResult,
+    LogLevel, OpFuture, OperationsHandler, RequestBody, ResponseBody, RuntimeLimits, Script,
+    SqlParam, SqlPrimitive, StorageOp, StorageResult, TerminationReason, WorkerCode,
 };
 use openworkers_runtime_wasm::WasmWorker;
 use std::collections::HashMap;
@@ -492,6 +493,235 @@ async fn test_request_body_reaches_the_guest() {
     };
 
     assert_eq!(&body[..], b"round trip");
+}
+
+/// Stands in for the runner's binding handlers: it records the SQL it was
+/// given and keeps KV and storage in memory so values can be read back
+#[derive(Default)]
+struct BindingOps {
+    queries: Mutex<Vec<(String, String, Vec<SqlParam>)>>,
+    values: Mutex<HashMap<String, serde_json::Value>>,
+    objects: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl OperationsHandler for BindingOps {
+    fn handle_binding_database(
+        &self,
+        binding: &str,
+        op: DatabaseOp,
+    ) -> OpFuture<'_, DatabaseResult> {
+        let DatabaseOp::Query { sql, params } = op;
+
+        self.queries
+            .lock()
+            .unwrap()
+            .push((binding.to_string(), sql.clone(), params));
+
+        // The runner answers a row-returning statement with an array and a
+        // mutation with its count
+        let json = match sql.starts_with("SELECT") {
+            true => r#"[{"id":1,"name":"widget"}]"#,
+            false => r#"{"rowsAffected":3}"#,
+        };
+
+        Box::pin(async move { DatabaseResult::Rows(json.to_string()) })
+    }
+
+    fn handle_binding_kv(&self, _binding: &str, op: KvOp) -> OpFuture<'_, KvResult> {
+        let mut values = self.values.lock().unwrap();
+
+        let result = match op {
+            KvOp::Get { key } => KvResult::Value(values.get(&key).cloned()),
+            KvOp::Put { key, value, .. } => {
+                values.insert(key, value);
+                KvResult::Ok
+            }
+            KvOp::Delete { key } => {
+                values.remove(&key);
+                KvResult::Ok
+            }
+            KvOp::List { prefix, .. } => KvResult::Keys(matching_keys(values.keys(), prefix)),
+        };
+
+        Box::pin(async move { result })
+    }
+
+    fn handle_binding_storage(&self, _binding: &str, op: StorageOp) -> OpFuture<'_, StorageResult> {
+        let mut objects = self.objects.lock().unwrap();
+
+        let result = match op {
+            StorageOp::Get { key } => StorageResult::Body(objects.get(&key).cloned()),
+            StorageOp::Put { key, body } => {
+                objects.insert(key, body);
+                StorageResult::Body(None)
+            }
+            StorageOp::Delete { key } => {
+                objects.remove(&key);
+                StorageResult::Body(None)
+            }
+            StorageOp::Head { key } => match objects.get(&key) {
+                Some(body) => StorageResult::Head {
+                    size: body.len() as u64,
+                    etag: Some("mock-etag".to_string()),
+                },
+                None => StorageResult::Error("Object not found".to_string()),
+            },
+            StorageOp::List { prefix, .. } => StorageResult::List {
+                keys: matching_keys(objects.keys(), prefix),
+                truncated: false,
+            },
+            StorageOp::Fetch { .. } => StorageResult::Error("fetch is not part of the WIT".into()),
+        };
+
+        Box::pin(async move { result })
+    }
+}
+
+fn matching_keys<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    prefix: Option<String>,
+) -> Vec<String> {
+    let prefix = prefix.unwrap_or_default();
+
+    keys.filter(|key| key.starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+async fn serve_with_bindings(path: &str) -> (HttpResponse, Arc<BindingOps>) {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let ops = Arc::new(BindingOps::default());
+
+    let mut worker = WasmWorker::new_with_ops(script, None, ops.clone())
+        .await
+        .expect("Failed to create worker");
+
+    let (event, rx) = Event::fetch(get_request(&format!("https://example.com{}", path)));
+    worker.exec(event).await.expect("Failed to execute event");
+
+    (rx.await.expect("Failed to receive response"), ops)
+}
+
+fn body_text(response: &HttpResponse) -> String {
+    let ResponseBody::Bytes(body) = &response.body else {
+        panic!("Expected Bytes response body");
+    };
+
+    String::from_utf8_lossy(body).into_owned()
+}
+
+#[tokio::test]
+async fn test_database_binding_binds_typed_params() {
+    let (response, ops) = serve_with_bindings("/db").await;
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        body_text(&response),
+        r#"first={"id":1,"name":"widget"} all=[{"id":1,"name":"widget"}] affected=3 first-rows=1"#
+    );
+
+    let queries = ops.queries.lock().unwrap();
+
+    assert_eq!(queries.len(), 3);
+
+    let (binding, sql, params) = &queries[0];
+
+    assert_eq!(binding, "DB");
+    assert_eq!(sql, "SELECT * FROM items WHERE id = $1");
+
+    assert!(matches!(
+        params[0],
+        SqlParam::Primitive(SqlPrimitive::Int(42))
+    ));
+    assert!(matches!(
+        params[1],
+        SqlParam::Primitive(SqlPrimitive::Float(f)) if f == 1.5
+    ));
+    assert!(matches!(
+        &params[2],
+        SqlParam::Primitive(SqlPrimitive::String(s)) if s == "widget"
+    ));
+    assert!(matches!(params[3], SqlParam::Primitive(SqlPrimitive::Null)));
+    assert!(matches!(
+        params[4],
+        SqlParam::Primitive(SqlPrimitive::Bool(true))
+    ));
+    assert!(matches!(
+        &params[5],
+        SqlParam::Array(values) if values.len() == 2
+    ));
+}
+
+#[tokio::test]
+async fn test_kv_binding_round_trips_values() {
+    let (response, ops) = serve_with_bindings("/kv").await;
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        body_text(&response),
+        r#"value="hello" keys=greeting deleted=true"#
+    );
+
+    assert!(ops.values.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_storage_binding_round_trips_bytes() {
+    let (response, ops) = serve_with_bindings("/storage-bytes").await;
+
+    assert_eq!(response.status, 200);
+
+    let expected: Vec<u8> = (0..=u8::MAX).collect();
+
+    let ResponseBody::Bytes(body) = &response.body else {
+        panic!("Expected Bytes response body");
+    };
+
+    assert_eq!(&body[..], &expected[..]);
+    assert_eq!(ops.objects.lock().unwrap()["blob.bin"], expected);
+}
+
+#[tokio::test]
+async fn test_storage_binding_reports_metadata() {
+    let (response, _) = serve_with_bindings("/storage-meta").await;
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        body_text(&response),
+        "size=256 etag=mock-etag keys=meta.bin truncated=false"
+    );
+}
+
+/// Without an operations handle there is nothing to route a binding call to,
+/// and the guest sees the error rather than a trap
+#[tokio::test]
+async fn test_binding_without_ops_reports_the_missing_handle() {
+    let script = Script {
+        code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
+        env: None,
+        bindings: vec![],
+    };
+
+    let mut worker = WasmWorker::new(script, None, None)
+        .await
+        .expect("Failed to create worker");
+
+    let (event, rx) = Event::fetch(get_request("https://example.com/db"));
+    worker.exec(event).await.expect("Failed to execute event");
+
+    let response = rx.await.expect("Failed to receive response");
+
+    assert_eq!(response.status, 500);
+    assert!(
+        body_text(&response).contains("no operations handle"),
+        "got: {}",
+        body_text(&response)
+    );
 }
 
 #[tokio::test]
