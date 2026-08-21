@@ -103,6 +103,35 @@ async fn a_precompiled_component_serves_the_same_response() {
     );
 }
 
+/// A host that just compiled a guest keeps the machine code from the worker
+/// itself, rather than paying Cranelift a second time
+#[tokio::test]
+async fn a_worker_serializes_the_component_it_compiled() {
+    let wasm_bytes = load_component("hello-worker");
+
+    let mut compiled = WasmWorker::new(hello_script(wasm_bytes), None, None)
+        .await
+        .expect("Failed to create worker");
+
+    let expected = serve(&mut compiled, "https://example.com/test").await;
+
+    let artifact = compiled
+        .serialize_component()
+        .expect("a compiled component should serialize");
+
+    // SAFETY: the artifact comes from the worker built a few lines above
+    let component = unsafe { PrecompiledComponent::from_trusted_bytes(artifact) };
+
+    let mut loaded = WasmWorker::new_precompiled(component, hello_script(Vec::new()), None, None)
+        .await
+        .expect("the artifact should load");
+
+    let actual = serve(&mut loaded, "https://example.com/test").await;
+
+    assert_eq!(actual.status, expected.status);
+    assert_eq!(body_of(&actual), body_of(&expected));
+}
+
 /// The scheduled export survives the round trip too, so a cron worker is not
 /// silently downgraded to an HTTP-only one
 #[tokio::test]
@@ -258,6 +287,12 @@ async fn report_cold_start_cost() {
     let compiled_first_exec = start.elapsed();
 
     let start = std::time::Instant::now();
+    compiled
+        .serialize_component()
+        .expect("a compiled component should serialize");
+    let serialize_time = start.elapsed();
+
+    let start = std::time::Instant::now();
     // SAFETY: the artifact comes from `precompile` above
     let component = unsafe { PrecompiledComponent::from_trusted_bytes(artifact.clone()) };
     let mut loaded = WasmWorker::new_precompiled(component, hello_script(Vec::new()), None, None)
@@ -279,7 +314,8 @@ async fn report_cold_start_cost() {
         artifact.len()
     );
     println!("  compile (WasmWorker::new):       {compile_time:?}");
-    println!("  precompile (serialized):         {precompile_time:?}");
+    println!("  precompile (compile + serialize):{precompile_time:?}");
+    println!("  serialize an existing component: {serialize_time:?}");
     println!("  load artifact (new_precompiled): {deserialize_time:?}");
     println!("  compatibility_key:               {key_time:?}");
     println!("  first exec, compiled:            {compiled_first_exec:?}");

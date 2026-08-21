@@ -505,6 +505,10 @@ impl Drop for OpsLogWriter {
 /// WebAssembly Worker using Wasmtime Component Model
 pub struct WasmWorker {
     engine: Engine,
+    /// The compiled component, for `serialize_component`. Each `*_pre` below
+    /// already holds it, so this is one more handle on the same image rather
+    /// than a second copy of it.
+    component: Component,
     /// None when the guest does not export wasi:http/incoming-handler
     proxy_pre: Option<ProxyPre<WasmState>>,
     /// None when the guest does not export the 0.3 wasi:http/handler
@@ -658,6 +662,7 @@ impl WasmWorker {
 
         Ok(Self {
             engine,
+            component,
             proxy_pre: proxy_pre.ok(),
             service_pre: service_pre.ok(),
             scheduled_pre: scheduled_pre.ok(),
@@ -665,6 +670,19 @@ impl WasmWorker {
             aborted: Arc::new(AtomicBool::new(false)),
             env: env.unwrap_or_default(),
             ops,
+        })
+    }
+
+    /// Serialize this worker's component, giving the same artifact
+    /// `crate::precompile` would have produced for it.
+    ///
+    /// A host that just paid for a compile can keep the machine code this way
+    /// instead of compiling the guest a second time. The bytes carry the same
+    /// trust contract as `crate::precompile` output; see
+    /// [`PrecompiledComponent`].
+    pub fn serialize_component(&self) -> Result<Vec<u8>, TerminationReason> {
+        self.component.serialize().map_err(|e| {
+            TerminationReason::InitializationError(format!("Failed to serialize component: {}", e))
         })
     }
 
