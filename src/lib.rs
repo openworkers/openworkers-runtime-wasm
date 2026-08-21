@@ -17,9 +17,11 @@
 mod bindings;
 mod fuel;
 mod precompile;
+mod shared;
 mod worker;
 
 pub use precompile::PrecompiledComponent;
 pub use precompile::compatibility_key;
 pub use precompile::precompile;
+pub use worker::PreparedComponent;
 pub use worker::WasmWorker;

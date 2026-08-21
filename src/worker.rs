@@ -3,10 +3,11 @@
 //! HTTP guests implement the standard wasi:http/proxy world; the cron entry
 //! point comes from the custom `openworkers:worker/scheduled` interface.
 
-use crate::bindings::{WorkerHost, WorkerHostPre};
+use crate::bindings::WorkerHostPre;
 use crate::fuel;
 use crate::precompile::PrecompiledComponent;
 use crate::precompile::check_wasm_magic;
+use crate::shared;
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use openworkers_core::{
@@ -21,7 +22,7 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
-use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
+use wasmtime::component::{Component, ResourceTable};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, Trap, UpdateDeadline};
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -44,10 +45,6 @@ use wasmtime_wasi_http::p3::WasiHttpHooks as P3WasiHttpHooks;
 use wasmtime_wasi_http::p3::WasiHttpView as P3WasiHttpView;
 use wasmtime_wasi_http::p3::bindings::ServicePre;
 use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode as P3ErrorCode;
-
-/// Interval of the background thread driving epoch interruption; also the
-/// granularity of wall-clock and abort checks
-const EPOCH_TICK: Duration = Duration::from_millis(10);
 
 /// Length at which an unterminated guest log line is emitted anyway
 const MAX_LOG_LINE: usize = 8 * 1024;
@@ -502,6 +499,33 @@ impl Drop for OpsLogWriter {
     }
 }
 
+/// The shareable, per-version part of a worker: the compiled component and
+/// its pre-instantiations against the process-wide linker.
+///
+/// Building one costs the compile (or artifact load) plus linking; assembling
+/// a [`WasmWorker`] from it costs a handful of reference-count bumps. A host
+/// serving many requests of one worker version holds one of these and calls
+/// [`WasmWorker::from_prepared`] per request.
+pub struct PreparedComponent {
+    engine: Engine,
+    component: Component,
+    proxy_pre: Option<ProxyPre<WasmState>>,
+    service_pre: Option<ServicePre<WasmState>>,
+    scheduled_pre: Option<WorkerHostPre<WasmState>>,
+    fuel: bool,
+}
+
+impl PreparedComponent {
+    /// Serialize the component, giving the same artifact `crate::precompile`
+    /// would have produced for it. The bytes carry the trust contract of
+    /// [`PrecompiledComponent`].
+    pub fn serialize(&self) -> Result<Vec<u8>, TerminationReason> {
+        self.component.serialize().map_err(|e| {
+            TerminationReason::InitializationError(format!("Failed to serialize component: {}", e))
+        })
+    }
+}
+
 /// WebAssembly Worker using Wasmtime Component Model
 pub struct WasmWorker {
     engine: Engine,
@@ -586,64 +610,67 @@ impl WasmWorker {
         ops: Option<OperationsHandle>,
         source: ComponentSource<'_>,
     ) -> Result<Self, TerminationReason> {
-        let limits = limits.unwrap_or_default();
+        let prepared = Self::prepare_source(&limits.clone().unwrap_or_default(), source)?;
 
-        let engine = Engine::new(&engine_config(&limits)).map_err(|e| {
-            TerminationReason::InitializationError(format!("Failed to create engine: {}", e))
-        })?;
+        Self::assemble(&prepared, env, limits, ops)
+    }
 
-        // Ticker thread; exits once the engine (and thus the worker) is dropped
-        let engine_weak = engine.weak();
+    /// Compile guest bytes into the shareable, per-version part of a worker.
+    ///
+    /// One `PreparedComponent` serves any number of [`WasmWorker::from_prepared`]
+    /// calls, which is where the instantiation cost of a request should live.
+    /// `limits` only matters for its CPU budget: fuel metering changes the
+    /// emitted code, so a prepared component only assembles under the same
+    /// fuel mode.
+    pub fn prepare(
+        wasm: &[u8],
+        limits: Option<RuntimeLimits>,
+    ) -> Result<PreparedComponent, TerminationReason> {
+        Self::prepare_source(&limits.unwrap_or_default(), ComponentSource::Wasm(wasm))
+    }
 
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(EPOCH_TICK);
+    /// Load an artifact `crate::precompile` produced into the shareable,
+    /// per-version part of a worker.
+    ///
+    /// Whoever built the `PrecompiledComponent` vouched for its bytes: read
+    /// its trust contract before calling this.
+    pub fn prepare_precompiled(
+        component: &PrecompiledComponent,
+        limits: Option<RuntimeLimits>,
+    ) -> Result<PreparedComponent, TerminationReason> {
+        Self::prepare_source(
+            &limits.unwrap_or_default(),
+            ComponentSource::Precompiled(component),
+        )
+    }
 
-                let Some(engine) = engine_weak.upgrade() else {
-                    break;
-                };
+    /// Assemble a worker from a prepared component, skipping compilation and
+    /// linking; the per-request path.
+    pub async fn from_prepared(
+        prepared: &PreparedComponent,
+        script: Script,
+        limits: Option<RuntimeLimits>,
+        ops: Option<OperationsHandle>,
+    ) -> Result<Self, TerminationReason> {
+        Self::assemble(prepared, script.env, limits, ops)
+    }
 
-                engine.increment_epoch();
-            }
-        });
-
+    fn prepare_source(
+        limits: &RuntimeLimits,
+        source: ComponentSource<'_>,
+    ) -> Result<PreparedComponent, TerminationReason> {
+        let fuel = shared::metered(limits);
+        let engine = shared::engine(fuel)?;
         let component = Self::load_component(&engine, source)?;
 
-        let mut linker = Linker::new(&engine);
-
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| {
-            TerminationReason::InitializationError(format!("Failed to add WASI to linker: {}", e))
-        })?;
-
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|e| {
-            TerminationReason::InitializationError(format!(
-                "Failed to add wasi:http to linker: {}",
-                e
-            ))
-        })?;
-
-        wasmtime_wasi_http::p3::add_to_linker(&mut linker).map_err(|e| {
-            TerminationReason::InitializationError(format!(
-                "Failed to add wasi:http 0.3 to linker: {}",
-                e
-            ))
-        })?;
-
-        // Linked for every guest; one that imports no binding simply never
-        // calls them
-        WorkerHost::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state).map_err(|e| {
-            TerminationReason::InitializationError(format!(
-                "Failed to add bindings to linker: {}",
-                e
-            ))
-        })?;
-
-        let instance_pre = linker.instantiate_pre(&component).map_err(|e| {
-            TerminationReason::InitializationError(format!(
-                "Failed to pre-instantiate component: {}",
-                e
-            ))
-        })?;
+        let instance_pre = shared::linker(fuel)?
+            .instantiate_pre(&component)
+            .map_err(|e| {
+                TerminationReason::InitializationError(format!(
+                    "Failed to pre-instantiate component: {}",
+                    e
+                ))
+            })?;
 
         // A guest may export either generation of the HTTP handler, the
         // scheduled handler, or a combination; a guest that binds none of
@@ -660,12 +687,36 @@ impl WasmWorker {
             )));
         }
 
-        Ok(Self {
+        Ok(PreparedComponent {
             engine,
             component,
             proxy_pre: proxy_pre.ok(),
             service_pre: service_pre.ok(),
             scheduled_pre: scheduled_pre.ok(),
+            fuel,
+        })
+    }
+
+    fn assemble(
+        prepared: &PreparedComponent,
+        env: Option<HashMap<String, String>>,
+        limits: Option<RuntimeLimits>,
+        ops: Option<OperationsHandle>,
+    ) -> Result<Self, TerminationReason> {
+        let limits = limits.unwrap_or_default();
+
+        if shared::metered(&limits) != prepared.fuel {
+            return Err(TerminationReason::InitializationError(
+                "prepared component and worker limits disagree on fuel metering".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            engine: prepared.engine.clone(),
+            component: prepared.component.clone(),
+            proxy_pre: prepared.proxy_pre.clone(),
+            service_pre: prepared.service_pre.clone(),
+            scheduled_pre: prepared.scheduled_pre.clone(),
             limits,
             aborted: Arc::new(AtomicBool::new(false)),
             env: env.unwrap_or_default(),
