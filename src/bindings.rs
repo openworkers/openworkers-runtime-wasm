@@ -82,13 +82,12 @@ async fn query(
 
     let started = Instant::now();
 
-    let json = match ops.handle_binding_database(&binding, op).await {
-        DatabaseResult::Rows(json) => json,
+    let rows: serde_json::Value = match ops.handle_binding_database(&binding, op).await {
+        DatabaseResult::Rows(json) => serde_json::from_str(&json)
+            .map_err(|e| format!("database returned invalid JSON: {}", e))?,
+        DatabaseResult::Table { columns, rows } => table_rows(&columns, rows)?,
         DatabaseResult::Error(e) => return Err(e),
     };
-
-    let rows: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| format!("database returned invalid JSON: {}", e))?;
 
     // Row-returning statements come back as an array; a mutation without
     // RETURNING reports its count instead
@@ -106,6 +105,40 @@ async fn query(
     };
 
     Ok((rows, meta))
+}
+
+/// Render typed rows as the JSON array the WIT carries, `SqlPrimitive::Bytes`
+/// tagged the way core serializes it. Bindings 0.2.0 carries `list<sql-value>`
+/// and needs none of this.
+fn table_rows(
+    columns: &[String],
+    rows: Vec<Vec<SqlPrimitive>>,
+) -> Result<serde_json::Value, String> {
+    let mut out = Vec::with_capacity(rows.len());
+
+    for (index, row) in rows.into_iter().enumerate() {
+        if row.len() != columns.len() {
+            return Err(format!(
+                "database returned {} values for {} columns in row {}",
+                row.len(),
+                columns.len(),
+                index
+            ));
+        }
+
+        let mut object = serde_json::Map::with_capacity(columns.len());
+
+        for (column, value) in columns.iter().zip(row) {
+            let value = serde_json::to_value(value)
+                .map_err(|e| format!("database returned an unrepresentable value: {}", e))?;
+
+            object.insert(column.clone(), value);
+        }
+
+        out.push(serde_json::Value::Object(object));
+    }
+
+    Ok(serde_json::Value::Array(out))
 }
 
 fn sql_param(param: database::SqlParam) -> SqlParam {

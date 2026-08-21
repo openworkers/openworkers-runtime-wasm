@@ -299,7 +299,12 @@ async fn ops_send_request_v3(
         builder = builder.header(name, value);
     }
 
-    let body_bytes = response.body.collect().await.unwrap_or_default();
+    let body_bytes = response
+        .body
+        .collect()
+        .await
+        .map_err(|e| P3ErrorCode::InternalError(Some(format!("response body failed: {}", e))))?
+        .unwrap_or_default();
 
     builder
         .body(full_body_v3(body_bytes))
@@ -356,7 +361,12 @@ async fn ops_send_request(
         builder = builder.header(name, value);
     }
 
-    let body_bytes = response.body.collect().await.unwrap_or_default();
+    let body_bytes = response
+        .body
+        .collect()
+        .await
+        .map_err(|e| ErrorCode::InternalError(Some(format!("response body failed: {}", e))))?
+        .unwrap_or_default();
 
     let resp = builder
         .body(full_body(body_bytes))
@@ -623,7 +633,7 @@ impl WasmWorker {
                 // The scheduled export only carries a timestamp, so
                 // non-schedule sources pass 0.
                 let scheduled_time = match &task_init.source {
-                    Some(TaskSource::Schedule { time }) => *time,
+                    Some(TaskSource::Schedule { time, .. }) => *time,
                     _ => 0,
                 };
 
@@ -678,7 +688,12 @@ impl WasmWorker {
 
         // Streaming request bodies are buffered here; pass-through streaming
         // is not implemented yet
-        let body_bytes = request.body.collect().await.unwrap_or_default();
+        let body_bytes = request
+            .body
+            .collect()
+            .await
+            .map_err(|e| TerminationReason::Other(format!("request body failed: {}", e)))?
+            .unwrap_or_default();
 
         let hyper_request = builder.body(full_body(body_bytes)).map_err(|e| {
             TerminationReason::Other(format!("could not build guest request: {}", e))
@@ -796,7 +811,12 @@ impl WasmWorker {
         }
 
         // Buffered at the core boundary; the guest still sees a stream
-        let body_bytes = request.body.collect().await.unwrap_or_default();
+        let body_bytes = request
+            .body
+            .collect()
+            .await
+            .map_err(|e| TerminationReason::Other(format!("request body failed: {}", e)))?
+            .unwrap_or_default();
 
         let hyper_request = builder.body(full_body_v3(body_bytes)).map_err(|e| {
             TerminationReason::Other(format!("could not build guest request: {}", e))
