@@ -50,6 +50,26 @@ const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// Length at which an unterminated guest log line is emitted anyway
 const MAX_LOG_LINE: usize = 8 * 1024;
 
+/// Engine settings, shared by execution and precompilation.
+///
+/// An artifact records the settings it was compiled with and only loads into
+/// an engine that matches, so this is the one place they may be decided.
+pub(crate) fn engine_config(limits: &RuntimeLimits) -> Config {
+    let mut config = Config::new();
+
+    // Epoch interruption drives wall-clock limits and abort()
+    config.epoch_interruption(true);
+
+    // The 0.3 async canonical ABI; inert for 0.2 guests
+    config.wasm_component_model_async(true);
+
+    if limits.max_cpu_time_ms > 0 {
+        config.consume_fuel(true);
+    }
+
+    config
+}
+
 pub(crate) struct WasmState {
     wasi: WasiCtx,
     http: WasiHttpCtx,
@@ -498,19 +518,7 @@ impl WasmWorker {
     ) -> Result<Self, TerminationReason> {
         let limits = limits.unwrap_or_default();
 
-        let mut config = Config::new();
-
-        // Epoch interruption drives wall-clock limits and abort()
-        config.epoch_interruption(true);
-
-        // The 0.3 async canonical ABI; inert for 0.2 guests
-        config.wasm_component_model_async(true);
-
-        if limits.max_cpu_time_ms > 0 {
-            config.consume_fuel(true);
-        }
-
-        let engine = Engine::new(&config).map_err(|e| {
+        let engine = Engine::new(&engine_config(&limits)).map_err(|e| {
             TerminationReason::InitializationError(format!("Failed to create engine: {}", e))
         })?;
 

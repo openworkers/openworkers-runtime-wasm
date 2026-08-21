@@ -9,9 +9,17 @@
 //! export `openworkers:worker/scheduled` (see `wit/worker.wit`), and guests
 //! that need a database, KV or object storage import `openworkers:bindings`
 //! (see `wit/bindings.wit`).
+//!
+//! Compiling a component is the bulk of a cold start, so a host that runs the
+//! same worker again can hold on to the machine code: see [`precompile`] and
+//! [`WasmWorker::new_precompiled`].
 
 mod bindings;
 mod fuel;
+mod precompile;
 mod worker;
 
+pub use precompile::PrecompiledComponent;
+pub use precompile::compatibility_key;
+pub use precompile::precompile;
 pub use worker::WasmWorker;
