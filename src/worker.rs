@@ -5,6 +5,8 @@
 
 use crate::bindings::{WorkerHost, WorkerHostPre};
 use crate::fuel;
+use crate::precompile::PrecompiledComponent;
+use crate::precompile::check_wasm_magic;
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use openworkers_core::{
@@ -68,6 +70,19 @@ pub(crate) fn engine_config(limits: &RuntimeLimits) -> Config {
     }
 
     config
+}
+
+/// Where a worker's component comes from.
+///
+/// The two arms are the whole security boundary: guest bytes are compiled and
+/// validated, artifacts are trusted and merely mapped in. Nothing infers the
+/// arm from the bytes themselves, or a tenant uploading an artifact-shaped
+/// blob would pick the trusted one.
+enum ComponentSource<'a> {
+    /// Guest-supplied WebAssembly, compiled here
+    Wasm(&'a [u8]),
+    /// Output of `crate::precompile`, loaded as is
+    Precompiled(&'a PrecompiledComponent),
 }
 
 pub(crate) struct WasmState {
@@ -516,6 +531,57 @@ impl WasmWorker {
         limits: Option<RuntimeLimits>,
         ops: Option<OperationsHandle>,
     ) -> Result<Self, TerminationReason> {
+        let Script { code, env, .. } = script;
+
+        let wasm_bytes = match &code {
+            WorkerCode::WebAssembly(bytes) => bytes,
+            WorkerCode::JavaScript(_) => {
+                return Err(TerminationReason::InitializationError(
+                    "WASM runtime cannot execute JavaScript code".to_string(),
+                ));
+            }
+            WorkerCode::Snapshot(_) => {
+                return Err(TerminationReason::InitializationError(
+                    "WASM runtime cannot execute snapshots: a precompiled component loads \
+                     through WasmWorker::new_precompiled"
+                        .to_string(),
+                ));
+            }
+        };
+
+        Self::build(env, limits, ops, ComponentSource::Wasm(wasm_bytes))
+    }
+
+    /// Build a worker from an artifact `crate::precompile` produced, skipping
+    /// compilation.
+    ///
+    /// `script.code` is not read; the component comes from `component`, and
+    /// only `script.env` and `script.bindings` still apply. `limits` must be
+    /// the limits `component` was precompiled under, or the engine refuses the
+    /// artifact.
+    ///
+    /// Whoever built the `PrecompiledComponent` vouched for its bytes: read
+    /// its trust contract before calling this.
+    pub async fn new_precompiled(
+        component: PrecompiledComponent,
+        script: Script,
+        limits: Option<RuntimeLimits>,
+        ops: Option<OperationsHandle>,
+    ) -> Result<Self, TerminationReason> {
+        Self::build(
+            script.env,
+            limits,
+            ops,
+            ComponentSource::Precompiled(&component),
+        )
+    }
+
+    fn build(
+        env: Option<HashMap<String, String>>,
+        limits: Option<RuntimeLimits>,
+        ops: Option<OperationsHandle>,
+        source: ComponentSource<'_>,
+    ) -> Result<Self, TerminationReason> {
         let limits = limits.unwrap_or_default();
 
         let engine = Engine::new(&engine_config(&limits)).map_err(|e| {
@@ -537,23 +603,7 @@ impl WasmWorker {
             }
         });
 
-        let wasm_bytes = match &script.code {
-            WorkerCode::WebAssembly(bytes) => bytes,
-            WorkerCode::JavaScript(_) => {
-                return Err(TerminationReason::InitializationError(
-                    "WASM runtime cannot execute JavaScript code".to_string(),
-                ));
-            }
-            WorkerCode::Snapshot(_) => {
-                return Err(TerminationReason::InitializationError(
-                    "WASM runtime cannot execute snapshots".to_string(),
-                ));
-            }
-        };
-
-        let component = Component::new(&engine, wasm_bytes).map_err(|e| {
-            TerminationReason::InitializationError(format!("Failed to compile component: {}", e))
-        })?;
+        let component = Self::load_component(&engine, source)?;
 
         let mut linker = Linker::new(&engine);
 
@@ -613,9 +663,39 @@ impl WasmWorker {
             scheduled_pre: scheduled_pre.ok(),
             limits,
             aborted: Arc::new(AtomicBool::new(false)),
-            env: script.env.unwrap_or_default(),
+            env: env.unwrap_or_default(),
             ops,
         })
+    }
+
+    fn load_component(
+        engine: &Engine,
+        source: ComponentSource<'_>,
+    ) -> Result<Component, TerminationReason> {
+        match source {
+            ComponentSource::Wasm(bytes) => {
+                check_wasm_magic(bytes)?;
+
+                Component::new(engine, bytes).map_err(|e| {
+                    TerminationReason::InitializationError(format!(
+                        "Failed to compile component: {}",
+                        e
+                    ))
+                })
+            }
+            ComponentSource::Precompiled(component) => {
+                // SAFETY: whoever built the PrecompiledComponent vouched for
+                // these bytes coming from `crate::precompile`; see its trust
+                // contract. A mismatched engine configuration is caught here
+                // and reported as an error.
+                unsafe { Component::deserialize(engine, component.as_bytes()) }.map_err(|e| {
+                    TerminationReason::InitializationError(format!(
+                        "Failed to load precompiled component: {}",
+                        e
+                    ))
+                })
+            }
+        }
     }
 
     pub async fn exec(&mut self, event: Event) -> Result<(), TerminationReason> {
