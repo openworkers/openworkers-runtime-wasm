@@ -2,8 +2,9 @@
 
 use openworkers_core::{
     DatabaseOp, DatabaseResult, Event, HttpMethod, HttpRequest, HttpResponse, KvOp, KvResult,
-    LogLevel, OpFuture, OperationsHandler, RequestBody, ResponseBody, RuntimeLimits, Script,
-    SqlParam, SqlPrimitive, StorageOp, StorageResult, TerminationReason, WorkerCode,
+    LogLevel, OpFuture, OperationsHandle, OperationsHandler, RequestBody, ResponseBody,
+    RuntimeLimits, Script, SqlParam, SqlPrimitive, StorageOp, StorageResult, TerminationReason,
+    WorkerCode,
 };
 use openworkers_runtime_wasm::WasmWorker;
 use std::collections::HashMap;
@@ -682,23 +683,48 @@ fn matching_keys<'a>(
         .collect()
 }
 
-async fn serve_with_bindings(path: &str) -> (HttpResponse, Arc<BindingOps>) {
+/// Answers every statement with the typed shape, a byte column included
+struct TableOps;
+
+impl OperationsHandler for TableOps {
+    fn handle_binding_database(
+        &self,
+        _binding: &str,
+        _op: DatabaseOp,
+    ) -> OpFuture<'_, DatabaseResult> {
+        Box::pin(async move {
+            DatabaseResult::Table {
+                columns: vec!["id".to_string(), "blob".to_string()],
+                rows: vec![vec![
+                    SqlPrimitive::Int(1),
+                    SqlPrimitive::Bytes(vec![1, 2, 3]),
+                ]],
+            }
+        })
+    }
+}
+
+async fn serve_with_ops(path: &str, ops: OperationsHandle) -> HttpResponse {
     let script = Script {
         code: WorkerCode::WebAssembly(load_hello_worker_wasm()),
         env: None,
         bindings: vec![],
     };
 
-    let ops = Arc::new(BindingOps::default());
-
-    let mut worker = WasmWorker::new_with_ops(script, None, ops.clone())
+    let mut worker = WasmWorker::new_with_ops(script, None, ops)
         .await
         .expect("Failed to create worker");
 
     let (event, rx) = Event::fetch(get_request(&format!("https://example.com{}", path)));
     worker.exec(event).await.expect("Failed to execute event");
 
-    (rx.await.expect("Failed to receive response"), ops)
+    rx.await.expect("Failed to receive response")
+}
+
+async fn serve_with_bindings(path: &str) -> (HttpResponse, Arc<BindingOps>) {
+    let ops = Arc::new(BindingOps::default());
+
+    (serve_with_ops(path, ops.clone()).await, ops)
 }
 
 fn body_text(response: &HttpResponse) -> String {
@@ -749,6 +775,18 @@ async fn test_database_binding_binds_typed_params() {
         &params[5],
         SqlParam::Array(values) if values.len() == 2
     ));
+}
+
+/// Typed rows reach the guest as JSON, a byte column keeping core's tagged form
+#[tokio::test]
+async fn test_database_binding_renders_typed_rows() {
+    let response = serve_with_ops("/db", Arc::new(TableOps)).await;
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        body_text(&response),
+        r#"first={"blob":{"$bytes":"AQID"},"id":1} all=[{"blob":{"$bytes":"AQID"},"id":1}] affected=1 first-rows=1"#
+    );
 }
 
 #[tokio::test]
