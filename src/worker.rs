@@ -26,25 +26,17 @@ use wasmtime::component::{Component, ResourceTable};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, Trap, UpdateDeadline};
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::Error as HttpError;
+use wasmtime_wasi_http::RequestOptions;
+use wasmtime_wasi_http::WasiBody;
 use wasmtime_wasi_http::WasiHttpCtx;
-use wasmtime_wasi_http::p2::HttpResult;
-use wasmtime_wasi_http::p2::WasiHttpCtxView;
-use wasmtime_wasi_http::p2::WasiHttpHooks;
-use wasmtime_wasi_http::p2::WasiHttpView;
+use wasmtime_wasi_http::WasiHttpCtxView;
+use wasmtime_wasi_http::WasiHttpHooks;
+use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
-use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
-use wasmtime_wasi_http::p2::body::{HyperIncomingBody, HyperOutgoingBody};
-use wasmtime_wasi_http::p2::types::{
-    HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig,
-};
 use wasmtime_wasi_http::p3::Request as P3Request;
-use wasmtime_wasi_http::p3::RequestOptions as P3RequestOptions;
-use wasmtime_wasi_http::p3::WasiHttpCtxView as P3WasiHttpCtxView;
-use wasmtime_wasi_http::p3::WasiHttpHooks as P3WasiHttpHooks;
-use wasmtime_wasi_http::p3::WasiHttpView as P3WasiHttpView;
 use wasmtime_wasi_http::p3::bindings::ServicePre;
-use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode as P3ErrorCode;
 
 /// Length at which an unterminated guest log line is emitted anyway
 const MAX_LOG_LINE: usize = 8 * 1024;
@@ -170,18 +162,6 @@ impl WasiHttpView for WasmState {
     }
 }
 
-// A store only ever runs one generation of guest, so both views can share
-// the same context and hooks
-impl P3WasiHttpView for WasmState {
-    fn http(&mut self) -> P3WasiHttpCtxView<'_> {
-        P3WasiHttpCtxView {
-            ctx: &mut self.http,
-            table: &mut self.table,
-            hooks: &mut self.hooks,
-        }
-    }
-}
-
 /// Per-store memory cap, none when the worker has no limit; records when the
 /// cap denied a growth so the failure can be reported as MemoryLimit instead
 /// of a generic trap
@@ -221,61 +201,28 @@ struct OpsHooks {
     ops: Option<OperationsHandle>,
 }
 
+/// Completion future the host interfaces pair with a body
+type Done = Box<dyn Future<Output = Result<(), HttpError>> + Send>;
+
 impl WasiHttpHooks for OpsHooks {
     fn send_request(
         &mut self,
-        request: hyper::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> HttpResult<HostFutureIncomingResponse> {
-        let Some(ops) = self.ops.clone() else {
-            return Err(ErrorCode::InternalError(Some(
-                "fetch not available: no operations handle".to_string(),
-            ))
-            .into());
-        };
-
-        Ok(HostFutureIncomingResponse::pending(
-            wasmtime_wasi::runtime::spawn(async move {
-                Ok(ops_send_request(ops, request, config).await)
-            }),
-        ))
-    }
-}
-
-/// Body type of the 0.3 host interfaces
-type P3Body = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, P3ErrorCode>;
-
-/// Completion future the 0.3 host interfaces pair with a body
-type P3Done = Box<dyn Future<Output = Result<(), P3ErrorCode>> + Send>;
-
-// The 0.3 face of the same bridge: wasi:http/client.send lands here
-impl P3WasiHttpHooks for OpsHooks {
-    fn send_request(
-        &mut self,
-        request: hyper::Request<P3Body>,
-        _options: Option<P3RequestOptions>,
-        _fut: P3Done,
-    ) -> Box<
-        dyn Future<
-                Output = Result<
-                    (hyper::Response<P3Body>, P3Done),
-                    wasmtime_wasi::TrappableError<P3ErrorCode>,
-                >,
-            > + Send,
-    > {
+        request: hyper::Request<WasiBody>,
+        _options: Option<RequestOptions>,
+        _fut: Done,
+    ) -> Box<dyn Future<Output = Result<(hyper::Response<WasiBody>, Done), HttpError>> + Send> {
         let ops = self.ops.clone();
 
         Box::new(async move {
             let Some(ops) = ops else {
-                return Err(P3ErrorCode::InternalError(Some(
+                return Err(HttpError::InternalError(Some(
                     "fetch not available: no operations handle".to_string(),
-                ))
-                .into());
+                )));
             };
 
-            let response = ops_send_request_v3(ops, request).await?;
+            let response = ops_send_request(ops, request).await?;
 
-            let done: P3Done = Box::new(std::future::ready(Ok(())));
+            let done: Done = Box::new(std::future::ready(Ok(())));
 
             Ok((response, done))
         })
@@ -283,23 +230,23 @@ impl P3WasiHttpHooks for OpsHooks {
 }
 
 /// Request and response are buffered whole; the ops handler has no streaming form
-async fn ops_send_request_v3(
+async fn ops_send_request(
     ops: OperationsHandle,
-    request: hyper::Request<P3Body>,
-) -> Result<hyper::Response<P3Body>, P3ErrorCode> {
+    request: hyper::Request<WasiBody>,
+) -> Result<hyper::Response<WasiBody>, HttpError> {
     let (parts, body) = request.into_parts();
 
     let body_bytes = body
         .collect()
         .await
-        .map_err(|e| P3ErrorCode::InternalError(Some(format!("request body failed: {}", e))))?
+        .map_err(|e| HttpError::InternalError(Some(format!("request body failed: {}", e))))?
         .to_bytes();
 
     let method: HttpMethod = parts
         .method
         .as_str()
         .parse()
-        .map_err(|_| P3ErrorCode::HttpRequestMethodInvalid)?;
+        .map_err(|_| HttpError::HttpRequestMethodInvalid)?;
 
     let mut headers = HashMap::new();
 
@@ -323,7 +270,7 @@ async fn ops_send_request_v3(
     let response = ops
         .handle_fetch(core_request)
         .await
-        .map_err(|e| P3ErrorCode::InternalError(Some(format!("fetch failed: {}", e))))?;
+        .map_err(|e| HttpError::InternalError(Some(format!("fetch failed: {}", e))))?;
 
     let mut builder = hyper::Response::builder().status(response.status);
 
@@ -335,89 +282,16 @@ async fn ops_send_request_v3(
         .body
         .collect()
         .await
-        .map_err(|e| P3ErrorCode::InternalError(Some(format!("response body failed: {}", e))))?
+        .map_err(|e| HttpError::InternalError(Some(format!("response body failed: {}", e))))?
         .unwrap_or_default();
 
     builder
-        .body(full_body_v3(body_bytes))
-        .map_err(|e| P3ErrorCode::InternalError(Some(format!("invalid response: {}", e))))
-}
-
-/// Request and response are buffered whole; the ops handler has no streaming form
-async fn ops_send_request(
-    ops: OperationsHandle,
-    request: hyper::Request<HyperOutgoingBody>,
-    config: OutgoingRequestConfig,
-) -> Result<IncomingResponse, ErrorCode> {
-    let (parts, body) = request.into_parts();
-
-    let body_bytes = body
-        .collect()
-        .await
-        .map_err(|e| ErrorCode::InternalError(Some(format!("request body failed: {}", e))))?
-        .to_bytes();
-
-    let method: HttpMethod = parts
-        .method
-        .as_str()
-        .parse()
-        .map_err(|_| ErrorCode::HttpRequestMethodInvalid)?;
-
-    let mut headers = HashMap::new();
-
-    for (name, value) in &parts.headers {
-        if let Ok(value) = value.to_str() {
-            headers.insert(name.to_string(), value.to_string());
-        }
-    }
-
-    let core_request = HttpRequest {
-        method,
-        url: parts.uri.to_string(),
-        headers,
-        body: if body_bytes.is_empty() {
-            RequestBody::None
-        } else {
-            RequestBody::Bytes(body_bytes)
-        },
-    };
-
-    let response = ops
-        .handle_fetch(core_request)
-        .await
-        .map_err(|e| ErrorCode::InternalError(Some(format!("fetch failed: {}", e))))?;
-
-    let mut builder = hyper::Response::builder().status(response.status);
-
-    for (name, value) in response.headers {
-        builder = builder.header(name, value);
-    }
-
-    let body_bytes = response
-        .body
-        .collect()
-        .await
-        .map_err(|e| ErrorCode::InternalError(Some(format!("response body failed: {}", e))))?
-        .unwrap_or_default();
-
-    let resp = builder
         .body(full_body(body_bytes))
-        .map_err(|e| ErrorCode::InternalError(Some(format!("invalid response: {}", e))))?;
-
-    Ok(IncomingResponse {
-        resp,
-        worker: None,
-        between_bytes_timeout: config.between_bytes_timeout,
-    })
+        .map_err(|e| HttpError::InternalError(Some(format!("invalid response: {}", e))))
 }
 
 /// A buffered hyper body with the error type wasi:http expects
-fn full_body(bytes: bytes::Bytes) -> HyperIncomingBody {
-    Full::new(bytes).map_err(|e| match e {}).boxed_unsync()
-}
-
-/// The same buffered body against the 0.3 error type
-fn full_body_v3(bytes: bytes::Bytes) -> P3Body {
+fn full_body(bytes: bytes::Bytes) -> WasiBody {
     Full::new(bytes).map_err(|e| match e {}).boxed_unsync()
 }
 
@@ -975,11 +849,12 @@ impl WasmWorker {
             .map_err(|e| TerminationReason::Other(format!("request body failed: {}", e)))?
             .unwrap_or_default();
 
-        let hyper_request = builder.body(full_body_v3(body_bytes)).map_err(|e| {
+        let hyper_request = builder.body(full_body(body_bytes)).map_err(|e| {
             TerminationReason::Other(format!("could not build guest request: {}", e))
         })?;
 
-        let (guest_request, _request_io) = P3Request::from_http(hyper_request);
+        let (guest_request, _request_io) =
+            P3Request::from_http(store.data_mut().http().hooks, hyper_request);
 
         // The epoch deadline only fires while guest code runs, so a guest
         // idling on a handle nothing will complete needs a host-side timeout
