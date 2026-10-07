@@ -91,8 +91,8 @@ let params = [SqlParam::Value(SqlValue::Integer(42))];
 let row = database::first("DB", "SELECT * FROM items WHERE id = $1", &params)?;
 ```
 
-`database` is shaped after D1: preparing a statement and binding its
-parameters happens guest-side, and rows come back as JSON text. `kv` values
+`database` runs PostgreSQL: parameters are `$1`, `$2`, bound guest-side, and
+rows come back as JSON text. `kv` values
 are JSON documents; `storage` bodies are opaque bytes.
 
 ## Limits
