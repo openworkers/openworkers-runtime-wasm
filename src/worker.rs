@@ -4,6 +4,8 @@
 //! point comes from the custom `openworkers:worker/scheduled` interface.
 
 use crate::bindings::WorkerHostPre;
+use crate::bindings::task::TaskHostPre;
+use crate::bindings::task::exports::openworkers::worker::task as wit_task;
 use crate::fuel;
 use crate::precompile::PrecompiledComponent;
 use crate::precompile::check_wasm_magic;
@@ -12,7 +14,8 @@ use http_body_util::BodyExt;
 use http_body_util::Full;
 use openworkers_core::{
     Event, HttpMethod, HttpRequest, HttpResponse, LogLevel, OperationsHandle, RequestBody,
-    ResponseBody, RuntimeLimits, Script, TaskResult, TaskSource, TerminationReason, WorkerCode,
+    ResponseBody, RuntimeLimits, Script, TaskInit, TaskResult, TaskSource, TerminationReason,
+    WorkerCode,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -386,6 +389,7 @@ pub struct PreparedComponent {
     proxy_pre: Option<ProxyPre<WasmState>>,
     service_pre: Option<ServicePre<WasmState>>,
     scheduled_pre: Option<WorkerHostPre<WasmState>>,
+    task_pre: Option<TaskHostPre<WasmState>>,
     fuel: bool,
 }
 
@@ -413,6 +417,8 @@ pub struct WasmWorker {
     service_pre: Option<ServicePre<WasmState>>,
     /// None when the guest does not export openworkers:worker/scheduled
     scheduled_pre: Option<WorkerHostPre<WasmState>>,
+    /// None when the guest does not export openworkers:worker/task
+    task_pre: Option<TaskHostPre<WasmState>>,
     limits: RuntimeLimits,
     aborted: Arc<AtomicBool>,
     env: HashMap<String, String>,
@@ -551,13 +557,17 @@ impl WasmWorker {
         // them needs every error to be diagnosable
         let proxy_pre = ProxyPre::new(instance_pre.clone());
         let service_pre = ServicePre::new(instance_pre.clone());
+        let task_pre = TaskHostPre::new(instance_pre.clone());
         let scheduled_pre = WorkerHostPre::new(instance_pre);
 
-        if let (Err(http), Err(v3), Err(scheduled)) = (&proxy_pre, &service_pre, &scheduled_pre) {
+        if let (Err(http), Err(v3), Err(scheduled), Err(task)) =
+            (&proxy_pre, &service_pre, &scheduled_pre, &task_pre)
+        {
             return Err(TerminationReason::InitializationError(format!(
                 "component binds neither wasi:http/incoming-handler ({http}), \
-                 wasi:http/handler@0.3.0 ({v3}), nor \
-                 openworkers:worker/scheduled ({scheduled})"
+                 wasi:http/handler@0.3.0 ({v3}), \
+                 openworkers:worker/scheduled ({scheduled}), nor \
+                 openworkers:worker/task ({task})"
             )));
         }
 
@@ -567,6 +577,7 @@ impl WasmWorker {
             proxy_pre: proxy_pre.ok(),
             service_pre: service_pre.ok(),
             scheduled_pre: scheduled_pre.ok(),
+            task_pre: task_pre.ok(),
             fuel,
         })
     }
@@ -591,6 +602,7 @@ impl WasmWorker {
             proxy_pre: prepared.proxy_pre.clone(),
             service_pre: prepared.service_pre.clone(),
             scheduled_pre: prepared.scheduled_pre.clone(),
+            task_pre: prepared.task_pre.clone(),
             limits,
             aborted: Arc::new(AtomicBool::new(false)),
             env: env.unwrap_or_default(),
@@ -660,6 +672,19 @@ impl WasmWorker {
                 let task_init = init.take().ok_or(TerminationReason::Other(
                     "TaskInit already consumed".to_string(),
                 ))?;
+
+                if self.task_pre.is_some() {
+                    return match self.handle_task(&task_init).await {
+                        Ok(result) => {
+                            let _ = task_init.res_tx.send(result);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let _ = task_init.res_tx.send(TaskResult::err(e.to_string()));
+                            Err(e)
+                        }
+                    };
+                }
 
                 // The scheduled export only carries a timestamp, so
                 // non-schedule sources pass 0.
@@ -938,6 +963,45 @@ impl WasmWorker {
         Ok(())
     }
 
+    /// Runs the task export. The guest's own failure is a failed result, not a
+    /// termination: the guest ran to the end.
+    async fn handle_task(&mut self, task: &TaskInit) -> Result<TaskResult, TerminationReason> {
+        let Some(task_pre) = &self.task_pre else {
+            return Err(TerminationReason::Other(
+                "guest does not export openworkers:worker/task".to_string(),
+            ));
+        };
+
+        let event = wit_task::TaskEvent {
+            task_id: task.task_id.clone(),
+            attempt: task.attempt,
+            payload: task.payload.as_ref().map(|payload| payload.to_string()),
+            source: task.source.as_ref().map(task_source),
+        };
+
+        let mut store = self.create_store();
+
+        let guest = match task_pre.instantiate_async(&mut store).await {
+            Ok(guest) => guest,
+            Err(e) => return Err(Self::termination_reason(&store, "instantiate", e)),
+        };
+
+        let answer = guest
+            .openworkers_worker_task()
+            .call_handle_task(&mut store, &event)
+            .await
+            .map_err(|e| Self::termination_reason(&store, "handle_task", e))?;
+
+        Ok(match answer {
+            Ok(None) => TaskResult::success(),
+            Ok(Some(json)) => match serde_json::from_str(&json) {
+                Ok(data) => TaskResult::ok(Some(data)),
+                Err(e) => TaskResult::err(format!("the task result is not JSON: {e}")),
+            },
+            Err(message) => TaskResult::err(message),
+        })
+    }
+
     /// Create a fresh store with limits armed
     fn create_store(&self) -> Store<WasmState> {
         let deadline = (self.limits.max_wall_clock_time_ms > 0)
@@ -1036,5 +1100,19 @@ impl openworkers_core::Worker for WasmWorker {
 
     fn abort(&mut self) {
         WasmWorker::abort(self)
+    }
+}
+
+fn task_source(source: &TaskSource) -> wit_task::TaskSource {
+    match source {
+        TaskSource::Schedule { time, cron } => wit_task::TaskSource::Schedule(wit_task::Schedule {
+            time: *time,
+            cron: cron.clone(),
+        }),
+        TaskSource::Chained { parent_task_id, .. } => {
+            wit_task::TaskSource::Chained(parent_task_id.clone())
+        }
+        TaskSource::Worker { worker_id, .. } => wit_task::TaskSource::Worker(worker_id.clone()),
+        TaskSource::Invoke { origin } => wit_task::TaskSource::Invoke(origin.clone()),
     }
 }

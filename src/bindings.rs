@@ -19,6 +19,16 @@ bindgen!({
     exports: { default: async },
 });
 
+/// The task export, in a module of its own because a second world's
+/// generated names would collide with the first's.
+pub mod task {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "task-host",
+        exports: { default: async },
+    });
+}
+
 use openworkers::bindings::database;
 use openworkers::bindings::kv;
 use openworkers::bindings::storage;

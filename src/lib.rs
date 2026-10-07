@@ -5,8 +5,9 @@
 //!
 //! HTTP guests are plain `wasi:http/proxy` components: they export
 //! `wasi:http/incoming-handler` and their `wasi:http/outgoing-handler` imports
-//! are served by the runner's `OperationsHandler`. Cron guests additionally
-//! export `openworkers:worker/scheduled` (see `wit/worker.wit`), and guests
+//! are served by the runner's `OperationsHandler`. Task guests additionally
+//! export `openworkers:worker/task`, or `openworkers:worker/scheduled` for cron
+//! alone (see `wit/worker.wit`), and guests
 //! that need a database, KV or object storage import `openworkers:bindings`
 //! (see `wit/bindings.wit`).
 //!

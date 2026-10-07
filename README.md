@@ -54,6 +54,13 @@ handles cron; the two differ by the `scheduled` export alone, which is how the
 host tells them apart. `scheduled-only` carries that export on its own, for an
 SDK that adds it to `fetch-worker` only when the guest has a handler.
 
+`task-only` carries the `task` export, which gets every task the platform runs:
+cron, chained, sent from a worker or invoked. Its event holds the task id, the
+attempt, the payload as JSON text and the source, with the cron expression for
+a cron task; the handler answers JSON text or an error message. When a guest
+exports `task`, the host calls it for every task and never calls `scheduled`.
+A guest with `scheduled` alone gets the trigger time and nothing else.
+
 wasi is declared at `0.2.0`, the floor of the 0.2 line, not at the host's patch
 level: every 0.2.x is semver-compatible and both wasm-tools and wasmtime resolve
 a 0.2.0 import or export against the newer implementation, so a toolchain that
@@ -172,12 +179,15 @@ worker.exec(task).await?;
 - `examples/fetch-worker` - `world fetch-worker`: HTTP and the bindings, no cron
 - `examples/proxy-worker` - a stock `wasi:http/proxy` component, built from the
   upstream `wasi` crate with no OpenWorkers-specific WIT
+- `examples/task-worker` - the `task` export next to `scheduled`: echoes each task
+  as JSON and shows the host calls `task`
 
 ```bash
 # Build the examples
 (cd examples/hello-worker && cargo build --target wasm32-wasip2 --release)
 (cd examples/fetch-worker && cargo build --target wasm32-wasip2 --release)
 (cd examples/proxy-worker && cargo build --target wasm32-wasip2 --release)
+(cd examples/task-worker && cargo build --target wasm32-wasip2 --release)
 
 # Run tests
 cargo test
